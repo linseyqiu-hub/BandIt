@@ -1,0 +1,13 @@
+# Data
+data/
+
+# Checkpoints
+checkpoints/
+
+# Python
+__pycache__/
+*.pyc
+.env
+
+# Anaconda
+*.egg-info/
