@@ -126,7 +126,7 @@ class BandItScorer(nn.Module):
         # --- Scoring head ---
         # Linear projection from essay representation to 5 band scores.
         # shape: (batch, 768) → (batch, 5)
-        scores = self.scoring_head(cls_vector)
+        scores = self.scoring_head(cls_vector.float())
 
         return scores
 
