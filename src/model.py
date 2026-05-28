@@ -18,7 +18,7 @@ from dataset import MODEL_NAME, LABEL_COLUMNS
 HIDDEN_SIZE = 768
 
 # Number of scoring criteria = number of output neurons in the head.
-NUM_LABELS = len(LABEL_COLUMNS)  # 5
+NUM_LABELS = len(LABEL_COLUMNS)  # 4
 
 
 # ------------------------------------------------------------------

@@ -16,7 +16,6 @@ import numpy as np
 # model.py and train.py must use this same list.
 # Position 0 = Overall, 1 = Task_Response, ..., 4 = Range_Accuracy.
 LABEL_COLUMNS = [
-    "Overall",
     "Task_Response",
     "Coherence_Cohesion",
     "Lexical_Resource",
