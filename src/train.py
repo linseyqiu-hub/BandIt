@@ -1,6 +1,6 @@
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-
+import json
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
@@ -24,21 +24,24 @@ CONFIG = {
     "seed":           42,
 
     # training
-    "epochs":         10,
+    "epochs":         20,          # more epochs since we're starting frozen
     "batch_size":     8,
-    "warmup_epochs":  1,        # how many epochs to warm up lr over
+    "warmup_epochs":  3,           # was 1 — slower ramp
 
     # optimizer
-    "backbone_lr":    2e-5,     # small — preserve pretrained weights
-    "head_lr":        1e-3,     # large — head trains from scratch
-    "weight_decay":   0.01,     # AdamW regularisation
+    "backbone_lr":    2e-6,        # was 2e-5 — much gentler
+    "head_lr":        3e-4,        # was 1e-3 — less aggressive
+    "weight_decay":   0.05,
 
     # model
-    "dropout":        0.1,
+    "dropout":        0.4,         # was 0.1 — stronger regularisation
+
+    # freezing strategy
+    "freeze_epochs":  5,           # train head-only for first N epochs
 
     # checkpointing
     "checkpoint_dir": "checkpoints",
-    "save_every":     2,        # save checkpoint every N epochs
+    "save_every":     2,
 }
 
 
@@ -374,6 +377,15 @@ def train():
 
     for epoch in range(start_epoch, CONFIG["epochs"] + 1):
 
+    # --- gradual unfreezing ---
+    # epochs 1-3: backbone frozen, only scoring head trains (3,845 params)
+    # epoch 4+:   backbone unfrozen, full fine-tuning resumes
+        if epoch == 1:
+            model.freeze_backbone()
+            print("[train] backbone frozen — training scoring head only")
+        elif epoch == CONFIG["freeze_epochs"] + 1:
+            model.unfreeze_backbone()
+            print("[train] backbone unfrozen — full fine-tuning")
         print(f"{'='*50}")
         print(f"epoch {epoch}/{CONFIG['epochs']}")
         print(f"{'='*50}")
@@ -421,9 +433,53 @@ def train():
     print(f"best val MAE: {best_val_mae:.4f} bands")
     print(f"best model saved to: {best_ckpt}")
     print(f"{'='*50}\n")
-
+    summary_path = os.path.join(CONFIG["checkpoint_dir"], "training_summary.txt")
+    save_summary(history, summary_path)
     return history
+def save_summary(history, path):
+    """
+    Saves training history to a human-readable txt file.
+    Call once at the end of train().
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write("=" * 50 + "\n")
+        f.write("BANDIT TRAINING SUMMARY\n")
+        f.write("=" * 50 + "\n\n")
 
+        f.write("CONFIG\n")
+        f.write("-" * 30 + "\n")
+        for k, v in CONFIG.items():
+            f.write(f"  {k:<20} {v}\n")
+        f.write("\n")
+
+        f.write("EPOCH RESULTS\n")
+        f.write("-" * 30 + "\n")
+        f.write(f"  {'epoch':<8} {'train_loss':<14} {'val_loss':<14} {'mean_mae':<12} {'Overall':<12} {'Task_Resp':<12} {'Coh_Coh':<12} {'Lex_Res':<12} {'Rng_Acc':<12}\n")
+        f.write("  " + "-" * 104 + "\n")
+        for h in history:
+            mae = h["val_mae"]
+            f.write(
+                f"  {h['epoch']:<8}"
+                f"{h['train_loss']:<14.4f}"
+                f"{h['val_loss']:<14.4f}"
+                f"{mae['mean_mae']:<12.4f}"
+                f"{mae['Overall']:<12.4f}"
+                f"{mae['Task_Response']:<12.4f}"
+                f"{mae['Coherence_Cohesion']:<12.4f}"
+                f"{mae['Lexical_Resource']:<12.4f}"
+                f"{mae['Range_Accuracy']:<12.4f}\n"
+            )
+
+        f.write("\n")
+        f.write("BEST MODEL\n")
+        f.write("-" * 30 + "\n")
+        best = min(history, key=lambda h: h["val_mae"]["mean_mae"])
+        f.write(f"  epoch:     {best['epoch']}\n")
+        f.write(f"  mean MAE:  {best['val_mae']['mean_mae']:.4f} bands\n")
+        f.write(f"  val loss:  {best['val_loss']:.4f}\n")
+
+    print(f"[train] summary saved → {path}")
 
 # ------------------------------------------------------------------
 # Entry point

@@ -5,7 +5,8 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader, random_split
 from transformers import DebertaV2Tokenizer
-
+from sklearn.model_selection import train_test_split
+import numpy as np
 
 # ------------------------------------------------------------------
 # Constants
@@ -90,6 +91,7 @@ class IELTSDataset(Dataset):
         # Store only the columns we need — saves memory
         self.essays = df["Essay"].tolist()                        # list of strings
         self.labels = df[LABEL_COLUMNS].values.astype("float32")  # numpy array (N, 5)
+        self.questions = df["Question"].tolist()   # add this
 
         print(f"[dataset] Loaded {len(self.essays)} essays.")
         print(f"[dataset] Score ranges:")
@@ -117,14 +119,16 @@ class IELTSDataset(Dataset):
                 "labels":         FloatTensor (5,)
             }
         """
+        question = self.questions[idx]
         essay = self.essays[idx]
+        text = f"Question: {question}\n\nEssay: {essay}"
 
         # Tokenize the essay.
         # padding="max_length" pads short essays to MAX_LENGTH with 0s.
         # truncation=True cuts essays longer than MAX_LENGTH.
         # return_tensors="pt" gives us PyTorch tensors directly.
         encoded = self.tokenizer(
-            essay,
+            text,
             max_length=self.max_length,
             padding="max_length",
             truncation=True,
@@ -158,44 +162,47 @@ def get_dataloaders(
     num_workers: int = 0,
     seed: int = 42,
 ):
-    """
-    Convenience function used by train.py.
-
-    Loads the full dataset, splits into train/val, wraps in DataLoaders.
-
-    Args:
-        csv_path:    Path to ielts_labeled.csv.
-        batch_size:  Samples per batch. Default 8 (safe for CPU).
-        val_split:   Fraction of data for validation. Default 0.2.
-        max_length:  Token sequence length. Default 512.
-        num_workers: DataLoader worker processes. Default 0 (main process only).
-                     On Windows, keep this 0 to avoid multiprocessing issues.
-        seed:        Random seed for reproducible split.
-
-    Returns:
-        train_loader: DataLoader for training set
-        val_loader:   DataLoader for validation set
-    """
-    # Load tokenizer
     print(f"[dataset] Loading tokenizer: {MODEL_NAME}")
     tokenizer = DebertaV2Tokenizer.from_pretrained(MODEL_NAME)
 
-    # Build the full dataset
     full_dataset = IELTSDataset(csv_path, tokenizer, max_length)
 
-    # Compute split sizes
-    total      = len(full_dataset)
-    val_size   = int(total * val_split)
-    train_size = total - val_size
-    print(f"[dataset] Split: {train_size} train / {val_size} val")
+    total = len(full_dataset)
 
-    # Random split — uses a Generator for reproducibility
-    generator = torch.Generator().manual_seed(seed)
-    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size], generator=generator)
+    # --- Stratification bins ---
+    # We bin Overall scores into integer bands for stratification.
+    # e.g. 6.5 → bin 6, 7.0 → bin 7
+    # This ensures each band is proportionally represented in both splits.
+    # We use the underlying labels array from the full dataset.
+    overall_scores = full_dataset.labels[:, 0]
+    bins = np.array([score_to_stratum(s) for s in overall_scores])
 
-    # DataLoaders
-    # shuffle=True for train (expose different orderings each epoch)
-    # shuffle=False for val (order doesn't matter for evaluation)
+    # --- Stratified split on indices ---
+    indices = np.arange(total)
+    train_indices, val_indices = train_test_split(
+        indices,
+        test_size=val_split,
+        random_state=seed,
+        stratify=bins,
+    )
+
+    print(f"[dataset] Stratified split: {len(train_indices)} train / {len(val_indices)} val")
+
+    # --- Verify distribution is balanced (optional debug) ---
+    train_bins = bins[train_indices]
+    val_bins   = bins[val_indices]
+    print("[dataset] Band distribution check:")
+    for b in sorted(np.unique(bins)):
+        train_count = (train_bins == b).sum()
+        val_count   = (val_bins == b).sum()
+        total_count = (bins == b).sum()
+        print(f"  Band {b}: {train_count} train / {val_count} val  (total {total_count})")
+
+    # --- Wrap in Subset ---
+    from torch.utils.data import Subset
+    train_dataset = Subset(full_dataset, train_indices)
+    val_dataset   = Subset(full_dataset, val_indices)
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -210,6 +217,12 @@ def get_dataloaders(
     )
 
     return train_loader, val_loader
+
+def score_to_stratum(score):
+    if score < 4.5:  return 0   # poor
+    elif score < 6.5: return 1  # developing
+    elif score < 8.0: return 2  # competent
+    else:             return 3  # expert
 
 
 # ------------------------------------------------------------------
