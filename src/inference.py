@@ -14,7 +14,6 @@ from model import BandItScorer
 MODEL_NAME   = "microsoft/deberta-v3-base"
 MAX_LENGTH   = 512
 LABEL_COLUMNS = [
-    "Overall",
     "Task_Response",
     "Coherence_Cohesion",
     "Lexical_Resource",
