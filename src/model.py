@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from transformers import DebertaV2Model, DebertaV2Config
 
-from dataset import MODEL_NAME, LABEL_COLUMNS
+from core.config import MODEL_NAME, LABEL_COLUMNS 
 
 
 # ------------------------------------------------------------------
