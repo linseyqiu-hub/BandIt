@@ -14,32 +14,40 @@ Scores IELTS writing submissions across the four official criteria and derives a
 **Examiner-Style Feedback** *(in progress)*
 Generates detailed, criterion-aligned written feedback grounded in the predicted scores.
 
-**Speaking Assessment** *(in progress)*
+**Speaking Assessment** *(planned)*
 Extends the platform to IELTS Speaking evaluation.
 
-> BandIt is under active construction. Features marked *in progress* are not yet available.
+> BandIt is under active construction. Features marked *in progress* or *planned* are not yet available.
 
 ---
 
-## Tech Stack
-
-- **Scoring model:** fine-tuned transformer (local inference)
-- **Feedback pipeline:** RAG + Claude API
-- **Backend:** FastAPI *(in progress)*
-- **Frontend:** React *(in progress)*
-- **Deployment:** HuggingFace Spaces + Vercel *(in progress)*
-
----
 
 ## Honest Limitations
 
 **Dataset size.** The current model is trained on a limited dataset centered around band 6–7. Performance is strongest in this range and weaker at the extremes (bands 1–4 and 8–9).
 
-**Synthetic sub-score labels.** Only Overall band scores in the training data come from real human examiners. The four sub-criterion labels are AI-generated proxies. This is the primary bottleneck for sub-score accuracy and is the target improvement when real examiner data becomes available.
+**Synthetic sub-score labels.** Only Overall band scores in the training data come from real human examiners. The four sub-criterion labels are AI-generated proxies anchored to Overall, with correlations of 0.96–0.99 (real IELTS sub-score correlations are 0.75–0.85). This is the primary bottleneck for sub-score accuracy and is the target improvement when real examiner data becomes available.
+
+**Regression to the mean.** Because training data is centered around band 6–7, the model under-penalises essays at the extremes — particularly very weak essays. It correctly identifies relative quality differences across criteria but compresses absolute scores toward the middle of the band range.
 
 **No question context in v1.** The first model version scored essays without grounding in the question prompt. This has been corrected in the current version — question and essay are both provided as input.
 
 **CPU inference only.** No GPU required. Suitable for demo and small-scale use.
+
+---
+
+## Continuous Improvement Plan
+
+BandIt is designed for iterative retraining as data accumulates:
+
+| Phase | Data source | Expected improvement |
+|---|---|---|
+| v1 (current) | Synthetic Haiku sub-score labels | Baseline |
+| v2 | Public IELTS datasets (Kaggle etc.) | Better range coverage |
+| v3 | Real user submissions (logged) | Authentic distribution |
+| v4 | Examiner-validated labels (partnership) | Sub-score accuracy |
+
+Every essay submitted through BandIt is a future training example. The platform logs submissions passively to build a proprietary dataset over time.
 
 ---
 
@@ -48,42 +56,38 @@ Extends the platform to IELTS Speaking evaluation.
 | Component | Status |
 |---|---|
 | Dataset pipeline | ✅ Complete |
-| Scoring model (Phase 1) | ✅ Complete |
+| Scoring model (v3) | ✅ Complete |
 | Inference engine | ✅ Complete |
-| Feedback generation (Phase 2) | 🔧 In progress |
-| Backend API | 🔧 In progress |
-| Frontend | 🔧 In progress |
-| Deployment | 🔧 In progress |
+| FastAPI backend | ✅ Complete |
+| React frontend | ✅ Complete |
+| Feedback generation (RAG + Claude) | 🔧 In progress |
+| SQLite request logging | 🔧 In progress |
+| Docker containerisation | 🔧 In progress |
+| Deployment (HuggingFace + Vercel) | 🔧 In progress |
+| Speaking assessment | 📋 Planned |
 
 ---
 
-## Quickstart
+## Running Locally
 
+**Backend**
 ```bash
-pip install torch transformers sentencepiece protobuf
+cd BandIt
+uvicorn src.main:app --reload
+# API available at http://localhost:8000
+# Docs at http://localhost:8000/docs
 ```
 
-```python
-from src.inference import BandItInferenceEngine
-
-engine = BandItInferenceEngine("checkpoints/best_model.pt")
-
-result = engine.score_with_metadata(
-    question="...",
-    essay="..."
-)
-
-print(result["scores"])
-# {
-#   "Task_Response":      6.5,
-#   "Coherence_Cohesion": 6.0,
-#   "Lexical_Resource":   6.5,
-#   "Range_Accuracy":     6.5,
-#   "Overall":            6.5
-# }
+**Frontend**
+```bash
+cd BandIt/frontend
+npm run dev
+# UI available at http://localhost:5173
 ```
 
 ---
+
+
 
 ## Acknowledgements
 
