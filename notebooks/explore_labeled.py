@@ -4,7 +4,7 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import pandas as pd
 import matplotlib.pyplot as plt
 
-df = pd.read_csv("data/ielts_labeled.csv")
+df = pd.read_csv("data/ielts_relabeled.csv")
 
 # === Basic Info ===
 print("=== Shape ===")

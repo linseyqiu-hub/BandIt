@@ -5,20 +5,91 @@ import torch
 import torch.nn as nn
 from transformers import DebertaV2Model, DebertaV2Config
 
-from core.config import MODEL_NAME, LABEL_COLUMNS 
+from core.config import MODEL_NAME, LABEL_COLUMNS
 
 
 # ------------------------------------------------------------------
 # Constants
 # ------------------------------------------------------------------
 
-# Size of DeBERTa-v3-base's hidden dimension.
-# 12 attention heads × 64 dims per head = 768.
-# This is the size of the CLS vector we read from the backbone.
-HIDDEN_SIZE = 768
+HIDDEN_SIZE = 768   # DeBERTa-v3-base hidden dim (12 heads × 64)
+NUM_LABELS  = len(LABEL_COLUMNS)  # 4
 
-# Number of scoring criteria = number of output neurons in the head.
-NUM_LABELS = len(LABEL_COLUMNS)  # 4
+
+# ------------------------------------------------------------------
+# Cross-attention module
+# ------------------------------------------------------------------
+
+class CrossAttention(nn.Module):
+    """
+    Single-head cross-attention for combining question and essay vectors.
+
+    Used exclusively by the TR head:
+        query  = q_vec  (what the question is asking)
+        key    = e_vec  (what the essay contains)
+        value  = e_vec
+
+    Output: a 768-dim vector representing "essay meaning as seen through
+    the lens of the question" — exactly what TR needs.
+
+    This is a lightweight module (~1.8M params total across Q/K/V projections).
+    With frozen backbone it is the most expressive part of the trainable model.
+    """
+
+    def __init__(self, hidden_size: int = HIDDEN_SIZE):
+        super().__init__()
+        self.hidden_size = hidden_size
+
+        # Linear projections for Q, K, V — standard attention setup
+        self.W_q = nn.Linear(hidden_size, hidden_size)
+        self.W_k = nn.Linear(hidden_size, hidden_size)
+        self.W_v = nn.Linear(hidden_size, hidden_size)
+
+        # Output projection — maps attended vector back to hidden_size
+        self.W_o = nn.Linear(hidden_size, hidden_size)
+
+        # Scale factor — prevents dot products from growing too large
+        # standard: 1 / sqrt(d_k)
+        self.scale = hidden_size ** -0.5
+
+        # Small init to avoid large attention weights at start of training
+        for layer in [self.W_q, self.W_k, self.W_v, self.W_o]:
+            nn.init.normal_(layer.weight, mean=0.0, std=0.02)
+            nn.init.zeros_(layer.bias)
+
+    def forward(self, q_vec: torch.Tensor, e_vec: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            q_vec: (batch, 768) — CLS from question-only encoding
+            e_vec: (batch, 768) — CLS from essay-only encoding
+
+        Returns:
+            (batch, 768) — attended vector for TR head input
+        """
+        # Project to Q, K, V spaces
+        Q = self.W_q(q_vec)   # (batch, 768)
+        K = self.W_k(e_vec)   # (batch, 768)
+        V = self.W_v(e_vec)   # (batch, 768)
+
+        # Scaled dot-product attention
+        # Q · K^T gives a scalar per sample — how much the question
+        # aligns with the essay at the CLS summary level
+        # unsqueeze/squeeze to allow bmm: (batch, 1, 768) × (batch, 768, 1)
+        attn_score = torch.bmm(
+            Q.unsqueeze(1),          # (batch, 1, 768)
+            K.unsqueeze(2),          # (batch, 768, 1)
+        ).squeeze(-1) * self.scale   # (batch, 1)
+
+        attn_weight = torch.sigmoid(attn_score)   # (batch, 1) — soft gate
+
+        # Weighted value: how much of the essay to "let through"
+        # based on question-essay alignment
+        attended = attn_weight * V   # (batch, 768) — broadcast
+
+        # Output projection
+        output = self.W_o(attended)  # (batch, 768)
+
+        return output
 
 
 # ------------------------------------------------------------------
@@ -27,230 +98,194 @@ NUM_LABELS = len(LABEL_COLUMNS)  # 4
 
 class BandItScorer(nn.Module):
     """
-    IELTS essay scoring model.
+    IELTS essay scoring model — v4 architecture.
 
     Architecture:
-        DeBERTa-v3-base (pretrained backbone, 86M params)
-            ↓
-        [CLS] token vector (768,)   ← essay summary
-            ↓
-        Linear(768 → 5)             ← scoring head
-            ↓
-        [Overall, Task_Response, Coherence_Cohesion, Lexical_Resource, Range_Accuracy]
+        Pass 1: question only  →  DeBERTa  →  q_vec (768)  ┐
+                                                             ├→ CrossAttention → tr_vec → TR head  → TR score
+        Pass 2: essay only     →  DeBERTa  →  e_vec (768)  ┘
+                                                             ├→ CC head → CC score
+                                                             ├→ LR head → LR score
+                                                             └→ RA head → RA score
 
-    The backbone extracts a rich semantic representation of the essay.
-    The scoring head maps that representation to 5 band scores.
-
-    Both are updated during fine-tuning, but at different learning rates:
-        - backbone: small lr (e.g. 2e-5) — nudge pretrained weights
-        - head:     larger lr (e.g. 1e-3) — train from scratch
-    train.py handles the learning rate split via parameter groups.
+    Key design decisions:
+        - Backbone permanently frozen — only heads + cross-attention train.
+          With 1434 essays, frozen backbone prevents overfitting and makes
+          training ~50x faster (no backprop through 86M params).
+        - Two forward passes, shared backbone — same DeBERTa weights called
+          twice with different inputs. Not separate models — one model, two calls.
+        - TR gets cross-attention(q_vec, e_vec) — question-aware representation.
+          Task Response is literally "did the essay answer the question."
+        - CC, LR, RA get e_vec directly — genuinely question-free.
+          Coherence, lexical resource, grammatical range don't depend on the question.
+        - Four independent Linear(768→1) heads — each criterion learns its own
+          projection instead of sharing one weight matrix.
     """
 
     def __init__(self, pretrained: bool = True, dropout: float = 0.1):
-        """
-        Args:
-            pretrained: If True, load pretrained DeBERTa weights from HuggingFace.
-                        If False, initialise DeBERTa with random weights (for testing only).
-            dropout:    Dropout rate applied to CLS vector before the scoring head.
-                        Regularisation — reduces overfitting on small dataset (1435 essays).
-        """
         super().__init__()
 
-        # --- Backbone ---
-        # DebertaV2Model is the bare transformer — no task-specific head on top.
-        # It outputs hidden states for every token position.
-        # We do NOT use DebertaV2ForSequenceClassification because that adds
-        # HuggingFace's own classification head. We want to attach our own.
+        # --- Shared backbone ---
+        # One DeBERTa instance, called twice per forward pass.
+        # Permanently frozen — weights never update.
         if pretrained:
             self.deberta = DebertaV2Model.from_pretrained(MODEL_NAME)
         else:
-            # random weights — only used in smoke test to skip the download
             config = DebertaV2Config.from_pretrained(MODEL_NAME)
             self.deberta = DebertaV2Model(config)
 
+        # Freeze immediately — permanent, not a warm-up phase
+        self._freeze_backbone()
+
         # --- Dropout ---
-        # Applied to the CLS vector before the scoring head.
-        # During training: randomly zeros out some of the 768 features.
-        # During inference: disabled automatically when model.eval() is called.
+        # Applied to both q_vec and e_vec before heads
         self.dropout = nn.Dropout(dropout)
 
-        # --- Scoring head ---
-        # Linear(768 → 5): one weight matrix (5, 768) + bias (5,).
-        # Randomly initialised — learns from scratch during fine-tuning.
-        # No activation function — raw regression output, not classification.
-        self.scoring_head = nn.Linear(HIDDEN_SIZE, NUM_LABELS)
+        # --- Cross-attention for TR ---
+        # Combines q_vec (question) and e_vec (essay) into a TR-specific vector
+        self.cross_attention = CrossAttention(HIDDEN_SIZE)
 
-        # Initialise scoring head weights with small values.
-        # Default PyTorch init is fine, but explicit init makes behaviour clear.
-        nn.init.normal_(self.scoring_head.weight, mean=0.0, std=0.02)
-        nn.init.zeros_(self.scoring_head.bias)
+        # --- Four independent scoring heads ---
+        # TR: takes cross-attended vector (768) → scalar
+        # CC, LR, RA: take e_vec (768) → scalar each
+        self.tr_head = nn.Linear(HIDDEN_SIZE, 1)
+        self.cc_head = nn.Linear(HIDDEN_SIZE, 1)
+        self.lr_head = nn.Linear(HIDDEN_SIZE, 1)
+        self.ra_head = nn.Linear(HIDDEN_SIZE, 1)
 
-    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        # Small init for all heads
+        for head in [self.tr_head, self.cc_head, self.lr_head, self.ra_head]:
+            nn.init.normal_(head.weight, mean=0.0, std=0.02)
+            nn.init.zeros_(head.bias)
+
+    def _freeze_backbone(self):
+        """Permanently freezes all DeBERTa parameters."""
+        for param in self.deberta.parameters():
+            param.requires_grad = False
+
+    def forward(
+        self,
+        q_input_ids:      torch.Tensor,   # (batch, 512) — question only
+        q_attention_mask: torch.Tensor,   # (batch, 512)
+        e_input_ids:      torch.Tensor,   # (batch, 512) — essay only
+        e_attention_mask: torch.Tensor,   # (batch, 512)
+    ) -> torch.Tensor:
         """
-        Forward pass — maps tokenized essays to band score predictions.
+        Dual-pass forward: question encoding + essay encoding → 4 scores.
 
         Args:
-            input_ids:      LongTensor, shape (batch, 512)
-                            Token IDs from the DeBERTa tokenizer.
-            attention_mask: LongTensor, shape (batch, 512)
-                            1 for real tokens, 0 for padding.
+            q_input_ids:      token IDs for question-only sequences
+            q_attention_mask: attention mask for question sequences
+            e_input_ids:      token IDs for essay-only sequences
+            e_attention_mask: attention mask for essay sequences
 
         Returns:
-            scores: FloatTensor, shape (batch, 5)
-                    Predicted band scores in order:
-                    [Overall, Task_Response, Coherence_Cohesion, Lexical_Resource, Range_Accuracy]
+            scores: FloatTensor (batch, 4)
+                    order: [Task_Response, Coherence_Cohesion, Lexical_Resource, Range_Accuracy]
         """
 
-        # --- Backbone forward pass ---
-        # DeBERTa processes the full token sequence through 12 transformer blocks.
-        # last_hidden_state contains output vectors for every token position.
-        # shape: (batch, 512, 768)
-        outputs = self.deberta(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-        )
+        # --- Pass 1: question only ---
+        # No gradient needed — backbone is frozen
+        with torch.no_grad():
+            q_outputs = self.deberta(
+                input_ids=q_input_ids,
+                attention_mask=q_attention_mask,
+            )
+        q_vec = q_outputs.last_hidden_state[:, 0, :]   # CLS (batch, 768)
+        q_vec = self.dropout(q_vec.float())
 
-        # --- Extract CLS vector ---
-        # Position 0 is always [CLS] — the essay summary vector.
-        # After 12 layers of bidirectional attention, it has attended to
-        # every token in the essay and aggregates global meaning.
-        # shape: (batch, 512, 768) → (batch, 768)
-        cls_vector = outputs.last_hidden_state[:, 0, :]
+        # --- Pass 2: essay only ---
+        with torch.no_grad():
+            e_outputs = self.deberta(
+                input_ids=e_input_ids,
+                attention_mask=e_attention_mask,
+            )
+        e_vec = e_outputs.last_hidden_state[:, 0, :]   # CLS (batch, 768)
+        e_vec = self.dropout(e_vec.float())
 
-        # --- Dropout ---
-        # Randomly zeros features during training for regularisation.
-        # shape unchanged: (batch, 768)
-        cls_vector = self.dropout(cls_vector)
+        # --- TR: cross-attention(q_vec, e_vec) → head ---
+        tr_vec = self.cross_attention(q_vec, e_vec)    # (batch, 768)
+        tr_score = self.tr_head(tr_vec)                # (batch, 1)
 
-        # --- Scoring head ---
-        # Linear projection from essay representation to 5 band scores.
-        # shape: (batch, 768) → (batch, 5)
-        scores = self.scoring_head(cls_vector.float())
+        # --- CC, LR, RA: e_vec → heads directly ---
+        cc_score = self.cc_head(e_vec)                 # (batch, 1)
+        lr_score = self.lr_head(e_vec)                 # (batch, 1)
+        ra_score = self.ra_head(e_vec)                 # (batch, 1)
+
+        # Concatenate into (batch, 4)
+        # Order matches LABEL_COLUMNS: [TR, CC, LR, RA]
+        scores = torch.cat([tr_score, cc_score, lr_score, ra_score], dim=1)
 
         return scores
 
-    def get_parameter_groups(self, backbone_lr: float = 2e-5, head_lr: float = 1e-3) -> list:
+    def get_parameter_groups(self, head_lr: float = 3e-4) -> list:
         """
-        Returns parameter groups with different learning rates for train.py.
+        Returns trainable parameter groups for the optimizer.
 
-        Usage in train.py:
-            optimizer = AdamW(model.get_parameter_groups(), weight_decay=0.01)
-
-        Args:
-            backbone_lr: Learning rate for DeBERTa parameters. Default 2e-5.
-            head_lr:     Learning rate for scoring head parameters. Default 1e-3.
-
-        Returns:
-            List of dicts, one per parameter group.
+        Backbone is frozen — only cross_attention and four heads are included.
+        Single lr since all trainable params are heads (no backbone to nudge gently).
         """
-        return [
-            {"params": self.deberta.parameters(),       "lr": backbone_lr},
-            {"params": self.dropout.parameters(),       "lr": head_lr},
-            {"params": self.scoring_head.parameters(),  "lr": head_lr},
-        ]
-
-    def freeze_backbone(self):
-        """
-        Freeze all DeBERTa parameters — only the scoring head will be trained.
-
-        Useful for a warm-up phase: train the head for a few epochs first,
-        then unfreeze the backbone for full fine-tuning.
-
-        Call model.unfreeze_backbone() to reverse.
-        """
-        for param in self.deberta.parameters():
-            param.requires_grad = False
-        print("[model] Backbone frozen. Only scoring head will be trained.")
-
-    def unfreeze_backbone(self):
-        """
-        Unfreeze all DeBERTa parameters for full fine-tuning.
-        """
-        for param in self.deberta.parameters():
-            param.requires_grad = True
-        print("[model] Backbone unfrozen. Full fine-tuning enabled.")
+        trainable = (
+            list(self.cross_attention.parameters()) +
+            list(self.tr_head.parameters()) +
+            list(self.cc_head.parameters()) +
+            list(self.lr_head.parameters()) +
+            list(self.ra_head.parameters())
+        )
+        return [{"params": trainable, "lr": head_lr}]
 
     def count_parameters(self) -> dict:
-        """
-        Returns trainable and total parameter counts.
-        Useful for verifying freeze/unfreeze state.
-        """
         total     = sum(p.numel() for p in self.parameters())
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         frozen    = total - trainable
-        return {
-            "total":     total,
-            "trainable": trainable,
-            "frozen":    frozen,
-        }
+        return {"total": total, "trainable": trainable, "frozen": frozen}
 
 
 # ------------------------------------------------------------------
-# Smoke test — run directly to verify architecture
+# Smoke test
 # python src/model.py
 # ------------------------------------------------------------------
 
 if __name__ == "__main__":
     print("=" * 50)
-    print("model.py smoke test")
+    print("model.py smoke test — v4 architecture")
     print("=" * 50)
 
-    # Use pretrained=False to skip the 900MB download during testing.
-    # The architecture is identical — only weights differ.
     print("\nBuilding model (random weights, no download)...")
-    model = BandItScorer(pretrained=False)
+    model = BandItScorer(pretrained=False, dropout=0.4)
     print("Model built.")
 
-    # 1. Parameter count
     counts = model.count_parameters()
     print(f"\nParameter counts:")
     print(f"  total:     {counts['total']:,}")
-    print(f"  trainable: {counts['trainable']:,}")
-    print(f"  frozen:    {counts['frozen']:,}")
+    print(f"  trainable: {counts['trainable']:,}  ← cross_attention + 4 heads only")
+    print(f"  frozen:    {counts['frozen']:,}  ← DeBERTa backbone")
 
-    # 2. Forward pass with dummy input
-    # Simulates one batch of 4 essays, 512 tokens each
-    print("\nRunning forward pass (batch=4, seq_len=512)...")
     batch_size = 4
     seq_len    = 512
 
-    dummy_input_ids      = torch.randint(0, 1000, (batch_size, seq_len))  # (4, 512)
-    dummy_attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long)  # (4, 512)
+    # Two separate inputs — question only and essay only
+    q_input_ids      = torch.randint(0, 1000, (batch_size, seq_len))
+    q_attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
+    e_input_ids      = torch.randint(0, 1000, (batch_size, seq_len))
+    e_attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
 
+    print(f"\nRunning forward pass (batch={batch_size}, seq_len={seq_len})...")
     with torch.no_grad():
-        scores = model(dummy_input_ids, dummy_attention_mask)
+        scores = model(q_input_ids, q_attention_mask, e_input_ids, e_attention_mask)
 
-    print(f"  input_ids shape:      {dummy_input_ids.shape}")
-    print(f"  attention_mask shape: {dummy_attention_mask.shape}")
-    print(f"  output scores shape:  {scores.shape}")
+    print(f"  output shape: {scores.shape}  ← should be ({batch_size}, 4)")
     assert scores.shape == (batch_size, NUM_LABELS), \
         f"Expected ({batch_size}, {NUM_LABELS}), got {scores.shape}"
-    print(f"  output shape correct: ({batch_size}, {NUM_LABELS}) ✓")
+    print(f"  output shape correct ✓")
+    print(f"  sample output: {scores[0].tolist()}")
 
-    # 3. Verify output is raw scores (no sigmoid/softmax clamping)
-    print(f"\n  sample output (random weights, not meaningful):")
-    print(f"  {scores[0].tolist()}")
-
-    # 4. Test freeze / unfreeze
-    print("\nTesting freeze_backbone()...")
-    model.freeze_backbone()
-    counts_frozen = model.count_parameters()
-    print(f"  trainable after freeze: {counts_frozen['trainable']:,}  (should be ~3,845)")
-
-    print("\nTesting unfreeze_backbone()...")
-    model.unfreeze_backbone()
-    counts_unfrozen = model.count_parameters()
-    print(f"  trainable after unfreeze: {counts_unfrozen['trainable']:,}  (should match total)")
-
-    # 5. Test parameter groups
-    print("\nTesting get_parameter_groups()...")
+    print("\nParameter groups:")
     groups = model.get_parameter_groups()
-    print(f"  number of groups: {len(groups)}")
     for i, g in enumerate(groups):
-        n_params = sum(p.numel() for p in g["params"])
-        print(f"  group {i}: lr={g['lr']}, params={n_params:,}")
+        n = sum(p.numel() for p in g["params"])
+        print(f"  group {i}: lr={g['lr']}, params={n:,}")
 
     print("\n" + "=" * 50)
-    print("All checks passed. model.py is ready.")
+    print("All checks passed. model.py v4 ready.")
     print("=" * 50)
