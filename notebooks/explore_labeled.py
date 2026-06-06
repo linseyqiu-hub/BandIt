@@ -4,7 +4,7 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import pandas as pd
 import matplotlib.pyplot as plt
 
-df = pd.read_csv("data/ielts_relabeled.csv")
+df = pd.read_csv("data/ielts_relabeled_v3.csv")
 
 # === Basic Info ===
 print("=== Shape ===")
@@ -22,7 +22,7 @@ for col in ["Overall", "Task_Response", "Coherence_Cohesion", "Lexical_Resource"
     print(df[col].describe())
 
 print("\n=== Sample Examiner Comment ===")
-print(df["Examiner_Commen"].iloc[0])
+print(df["Examiner_Comment"].iloc[0])
 
 # === Correlation between scores ===
 print("\n=== Score Correlations ===")

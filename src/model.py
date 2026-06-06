@@ -25,9 +25,9 @@ class CrossAttention(nn.Module):
     Single-head cross-attention for combining question and essay vectors.
 
     Used exclusively by the TR head:
-        query  = q_vec  (what the question is asking)
-        key    = e_vec  (what the essay contains)
-        value  = e_vec
+        query  = W_q(q_vec)   # what the question is looking for
+        key    = W_k(e_vec)   # essay projected for matching
+        value  = W_v(e_vec)   # essay projected for output
 
     Output: a 768-dim vector representing "essay meaning as seen through
     the lens of the question" — exactly what TR needs.
