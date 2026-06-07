@@ -22,11 +22,12 @@ CONFIG = {
     "seed":           42,
 
     # training
-    "epochs":         30,          # more epochs — training is fast with frozen backbone
+    "epochs":         30,
     "batch_size":     8,
     "warmup_epochs":  2,
 
-    # optimizer — single lr, backbone is frozen
+    # optimizer
+    "backbone_lr":    1e-6,        # very gentle — heads already trained for 16 epochs
     "head_lr":        3e-4,
     "weight_decay":   0.05,
 
@@ -36,7 +37,10 @@ CONFIG = {
     # checkpointing
     "checkpoint_dir": "checkpoints",
     "save_every":     2,
-    "best_model_name": "best_model_v4.pt",   # v3 best_model.pt is preserved
+    "best_model_name": "best_model_v4.pt",
+
+    # unfreezing
+    "unfreeze_epoch": 17,          # backbone unfreezes here
 }
 
 
@@ -50,13 +54,9 @@ def mse_loss(predictions: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
 
 
 def mae_metric(predictions: torch.Tensor, labels: torch.Tensor) -> dict:
-    """
-    MAE per criterion + mean across all 4.
-    Returns a dict for logging and model selection.
-    """
     with torch.no_grad():
-        abs_errors    = (predictions - labels).abs()   # (batch, 4)
-        per_criterion = abs_errors.mean(dim=0)         # (4,)
+        abs_errors    = (predictions - labels).abs()
+        per_criterion = abs_errors.mean(dim=0)
         mean_mae      = abs_errors.mean().item()
 
     result = {"mean_mae": mean_mae}
@@ -70,35 +70,28 @@ def mae_metric(predictions: torch.Tensor, labels: torch.Tensor) -> dict:
 # ------------------------------------------------------------------
 
 def train_one_epoch(model, loader, optimizer, scheduler, device, epoch):
-    """One full pass through the training set."""
     model.train()
 
     total_loss  = 0.0
     num_batches = 0
 
     for batch_idx, batch in enumerate(loader):
+        q_input_ids      = batch["q_input_ids"].to(device)
+        q_attention_mask = batch["q_attention_mask"].to(device)
+        e_input_ids      = batch["e_input_ids"].to(device)
+        e_attention_mask = batch["e_attention_mask"].to(device)
+        labels           = batch["labels"].to(device)
 
-        # Dual inputs — question only and essay only
-        q_input_ids      = batch["q_input_ids"].to(device)       # (batch, 512)
-        q_attention_mask = batch["q_attention_mask"].to(device)  # (batch, 512)
-        e_input_ids      = batch["e_input_ids"].to(device)       # (batch, 512)
-        e_attention_mask = batch["e_attention_mask"].to(device)  # (batch, 512)
-        labels           = batch["labels"].to(device)            # (batch, 4)
-
-        # Forward pass — two encoder calls inside model
         predictions = model(
             q_input_ids, q_attention_mask,
             e_input_ids, e_attention_mask,
-        )  # (batch, 4)
+        )
 
         loss = mse_loss(predictions, labels)
 
         optimizer.zero_grad()
         loss.backward()
-
-        # Clip gradients — only affects trainable params (heads + cross_attention)
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
         optimizer.step()
         scheduler.step()
 
@@ -116,7 +109,6 @@ def train_one_epoch(model, loader, optimizer, scheduler, device, epoch):
 # ------------------------------------------------------------------
 
 def validate(model, loader, device):
-    """One full pass through the validation set. No gradients."""
     model.eval()
 
     total_loss  = 0.0
@@ -143,8 +135,8 @@ def validate(model, loader, device):
             all_preds.append(predictions)
             all_labels.append(labels)
 
-    all_preds  = torch.cat(all_preds,  dim=0)   # (val_size, 4)
-    all_labels = torch.cat(all_labels, dim=0)   # (val_size, 4)
+    all_preds  = torch.cat(all_preds,  dim=0)
+    all_labels = torch.cat(all_labels, dim=0)
 
     avg_loss = total_loss / num_batches
     mae      = mae_metric(all_preds, all_labels)
@@ -172,8 +164,8 @@ def save_checkpoint(model, optimizer, scheduler, epoch, val_mae, path):
 def load_checkpoint(path, model, optimizer=None, scheduler=None):
     checkpoint = torch.load(path, map_location="cpu")
     model.load_state_dict(checkpoint["model_state"])
-    if optimizer  is not None: optimizer.load_state_dict(checkpoint["optimizer_state"])
-    if scheduler  is not None: scheduler.load_state_dict(checkpoint["scheduler_state"])
+    if optimizer is not None: optimizer.load_state_dict(checkpoint["optimizer_state"])
+    if scheduler is not None: scheduler.load_state_dict(checkpoint["scheduler_state"])
     epoch   = checkpoint["epoch"]
     val_mae = checkpoint["val_mae"]
     print(f"  [checkpoint] loaded ← {path}  (epoch {epoch}, val MAE {val_mae:.4f})")
@@ -181,7 +173,6 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None):
 
 
 def find_latest_checkpoint(ckpt_dir, prefix="v4_epoch_"):
-    """Finds the latest epoch_XX.pt checkpoint for v4 runs."""
     if not os.path.exists(ckpt_dir):
         return None
     candidates = [
@@ -202,7 +193,6 @@ def train():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\n[train] device: {device}")
 
-    # --- Data ---
     print("[train] loading data...")
     train_loader, val_loader = get_dataloaders(
         csv_path   = CONFIG["csv_path"],
@@ -213,7 +203,6 @@ def train():
     )
     print(f"[train] train batches: {len(train_loader)} | val batches: {len(val_loader)}")
 
-    # --- Model ---
     print("[train] building model...")
     model = BandItScorer(pretrained=True, dropout=CONFIG["dropout"])
     model = model.float()
@@ -221,17 +210,25 @@ def train():
 
     counts = model.count_parameters()
     print(f"[train] parameters: {counts['total']:,} total")
-    print(f"[train]             {counts['trainable']:,} trainable  ← cross_attention + 4 heads")
-    print(f"[train]             {counts['frozen']:,} frozen     ← DeBERTa backbone")
+    print(f"[train]             {counts['trainable']:,} trainable")
+    print(f"[train]             {counts['frozen']:,} frozen")
 
     # --- Optimizer ---
-    # Single parameter group — backbone is frozen, no lr split needed
+    # Two parameter groups — backbone gets its own tiny lr when unfrozen.
+    # Backbone params are frozen at model init so AdamW won't update them
+    # until requires_grad is set to True at unfreeze_epoch.
     optimizer = AdamW(
-        model.get_parameter_groups(head_lr=CONFIG["head_lr"]),
+        [
+            {"params": model.deberta.parameters(),      "lr": CONFIG["backbone_lr"]},
+            {"params": list(model.cross_attention.parameters()) +
+                       list(model.tr_head.parameters()) +
+                       list(model.cc_head.parameters()) +
+                       list(model.lr_head.parameters()) +
+                       list(model.ra_head.parameters()), "lr": CONFIG["head_lr"]},
+        ],
         weight_decay=CONFIG["weight_decay"],
     )
 
-    # --- Scheduler ---
     total_steps  = len(train_loader) * CONFIG["epochs"]
     warmup_steps = len(train_loader) * CONFIG["warmup_epochs"]
     scheduler    = get_linear_schedule_with_warmup(
@@ -241,7 +238,6 @@ def train():
     )
     print(f"[train] total steps: {total_steps} | warmup steps: {warmup_steps}")
 
-    # --- Resume from v4 checkpoint if available ---
     start_epoch  = 1
     best_val_mae = float("inf")
     best_ckpt    = os.path.join(CONFIG["checkpoint_dir"], CONFIG["best_model_name"])
@@ -251,7 +247,10 @@ def train():
 
     if latest_ckpt:
         print(f"[train] found v4 checkpoint: {latest_ckpt}")
-        resumed_epoch, resumed_mae = load_checkpoint(latest_ckpt, model, optimizer, scheduler)
+        resumed_epoch, resumed_mae = load_checkpoint(latest_ckpt, model)
+        # NOTE: we do NOT restore optimizer/scheduler state here —
+        # we just added a new parameter group (backbone) so the old
+        # optimizer state is incompatible. Fresh optimizer is correct.
         start_epoch  = resumed_epoch + 1
         best_val_mae = resumed_mae
 
@@ -265,7 +264,6 @@ def train():
             return history
     else:
         print(f"[train] no v4 checkpoint found — starting from scratch")
-        # Explicitly confirm v3 checkpoint is untouched
         v3_path = os.path.join(CONFIG["checkpoint_dir"], "best_model.pt")
         if os.path.exists(v3_path):
             print(f"[train] v3 best_model.pt preserved at {v3_path} ✓")
@@ -273,6 +271,14 @@ def train():
     print(f"[train] starting from epoch {start_epoch}/{CONFIG['epochs']}\n")
 
     for epoch in range(start_epoch, CONFIG["epochs"] + 1):
+
+        # --- Unfreeze backbone at unfreeze_epoch ---
+        if epoch == CONFIG["unfreeze_epoch"]:
+            for param in model.deberta.parameters():
+                param.requires_grad = True
+            counts = model.count_parameters()
+            print(f"[train] backbone unfrozen at epoch {epoch} — lr={CONFIG['backbone_lr']}")
+            print(f"[train] trainable params now: {counts['trainable']:,}")
 
         print(f"{'='*50}")
         print(f"epoch {epoch}/{CONFIG['epochs']}")
@@ -288,12 +294,10 @@ def train():
         for col in LABEL_COLUMNS:
             print(f"    {col:<25} {val_mae[col]:.4f}")
 
-        # Save every N epochs — v4 prefix to avoid collisions with v3 checkpoints
         if epoch % CONFIG["save_every"] == 0:
             ckpt_path = os.path.join(CONFIG["checkpoint_dir"], f"v4_epoch_{epoch:02d}.pt")
             save_checkpoint(model, optimizer, scheduler, epoch, val_mae["mean_mae"], ckpt_path)
 
-        # Save best
         if val_mae["mean_mae"] < best_val_mae:
             best_val_mae = val_mae["mean_mae"]
             save_checkpoint(model, optimizer, scheduler, epoch, val_mae["mean_mae"], best_ckpt)
