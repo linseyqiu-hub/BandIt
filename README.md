@@ -11,7 +11,7 @@ BandIt is being built as an end-to-end IELTS preparation platform — not just a
 **Essay Scoring** *(available)*
 Scores IELTS writing submissions across the four official criteria and derives an Overall band score per the official IELTS standard.
 
-**Examiner-Style Feedback** *(in progress)*
+**Examiner-Style Feedback** *(available)*
 Generates detailed, criterion-aligned written feedback grounded in the predicted scores.
 
 **Speaking Assessment** *(planned)*
@@ -36,37 +36,7 @@ Extends the platform to IELTS Speaking evaluation.
 
 ---
 
-## Continuous Improvement Plan
 
-BandIt is designed for iterative retraining as data accumulates:
-
-| Phase | Data source | Expected improvement |
-|---|---|---|
-| v1 (current) | Synthetic Haiku sub-score labels | Baseline |
-| v2 | Public IELTS datasets (Kaggle etc.) | Better range coverage |
-| v3 | Real user submissions (logged) | Authentic distribution |
-| v4 | Examiner-validated labels (partnership) | Sub-score accuracy |
-
-Every essay submitted through BandIt is a future training example. The platform logs submissions passively to build a proprietary dataset over time.
-
----
-
-## Status
-
-| Component | Status |
-|---|---|
-| Dataset pipeline | ✅ Complete |
-| Scoring model (v3) | ✅ Complete |
-| Inference engine | ✅ Complete |
-| FastAPI backend | ✅ Complete |
-| React frontend | ✅ Complete |
-| Feedback generation (RAG + Claude) | 🔧 In progress |
-| SQLite request logging | 🔧 In progress |
-| Docker containerisation | 🔧 In progress |
-| Deployment (HuggingFace + Vercel) | 🔧 In progress |
-| Speaking assessment | 📋 Planned |
-
----
 
 ## Running Locally
 
