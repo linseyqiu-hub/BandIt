@@ -4,7 +4,7 @@ import json
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from transformers import get_linear_schedule_with_warmup
+from transformers import get_cosine_schedule_with_warmup
 
 from dataset import get_dataloaders, LABEL_COLUMNS
 from model import BandItScorer
@@ -16,31 +16,28 @@ from model import BandItScorer
 
 CONFIG = {
     # data
-    "csv_path":       "data/ielts_relabeled.csv",
-    "max_length":     512,
-    "val_split":      0.2,
-    "seed":           42,
+    "csv_path":        "data/ielts_relabeled_v3.csv",
+    "max_length":      512,
+    "val_split":       0.2,
+    "seed":            42,
 
     # training
-    "epochs":         30,
-    "batch_size":     8,
-    "warmup_epochs":  2,
+    "epochs":          30,
+    "batch_size":      8,
+    "warmup_epochs":   3,
 
     # optimizer
-    "backbone_lr":    1e-6,        # very gentle — heads already trained for 16 epochs
-    "head_lr":        3e-4,
-    "weight_decay":   0.05,
+    "backbone_lr":     1e-6,
+    "head_lr":         2e-4,
+    "weight_decay":    0.05,
 
     # model
-    "dropout":        0.4,
+    "dropout":         0.4,
 
     # checkpointing
-    "checkpoint_dir": "checkpoints",
-    "save_every":     2,
-    "best_model_name": "best_model_v4.pt",
-
-    # unfreezing
-    "unfreeze_epoch": 17,          # backbone unfreezes here
+    "checkpoint_dir":  "checkpoints",
+    "save_every":      2,
+    "best_model_name": "best_model_v5.pt",
 }
 
 
@@ -49,7 +46,6 @@ CONFIG = {
 # ------------------------------------------------------------------
 
 def mse_loss(predictions: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    """MSE over all 4 criteria simultaneously."""
     return nn.MSELoss()(predictions, labels)
 
 
@@ -161,18 +157,16 @@ def save_checkpoint(model, optimizer, scheduler, epoch, val_mae, path):
     print(f"  [checkpoint] saved → {path}")
 
 
-def load_checkpoint(path, model, optimizer=None, scheduler=None):
+def load_checkpoint(path, model):
     checkpoint = torch.load(path, map_location="cpu")
     model.load_state_dict(checkpoint["model_state"])
-    if optimizer is not None: optimizer.load_state_dict(checkpoint["optimizer_state"])
-    if scheduler is not None: scheduler.load_state_dict(checkpoint["scheduler_state"])
     epoch   = checkpoint["epoch"]
     val_mae = checkpoint["val_mae"]
     print(f"  [checkpoint] loaded ← {path}  (epoch {epoch}, val MAE {val_mae:.4f})")
     return epoch, val_mae
 
 
-def find_latest_checkpoint(ckpt_dir, prefix="v4_epoch_"):
+def find_latest_checkpoint(ckpt_dir, prefix="v5_epoch_"):
     if not os.path.exists(ckpt_dir):
         return None
     candidates = [
@@ -207,6 +201,9 @@ def train():
     model = BandItScorer(pretrained=True, dropout=CONFIG["dropout"])
     model = model.float()
     model.to(device)
+    for param in model.deberta.parameters():
+        param.requires_grad = True
+    print("[train] backbone unfrozen from epoch 1")
 
     counts = model.count_parameters()
     print(f"[train] parameters: {counts['total']:,} total")
@@ -214,9 +211,6 @@ def train():
     print(f"[train]             {counts['frozen']:,} frozen")
 
     # --- Optimizer ---
-    # Two parameter groups — backbone gets its own tiny lr when unfrozen.
-    # Backbone params are frozen at model init so AdamW won't update them
-    # until requires_grad is set to True at unfreeze_epoch.
     optimizer = AdamW(
         [
             {"params": model.deberta.parameters(),      "lr": CONFIG["backbone_lr"]},
@@ -229,12 +223,14 @@ def train():
         weight_decay=CONFIG["weight_decay"],
     )
 
+    # --- Scheduler — always built for full 50 epochs ---
     total_steps  = len(train_loader) * CONFIG["epochs"]
     warmup_steps = len(train_loader) * CONFIG["warmup_epochs"]
-    scheduler    = get_linear_schedule_with_warmup(
+    scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps   = warmup_steps,
         num_training_steps = total_steps,
+        num_cycles         = 0.5,
     )
     print(f"[train] total steps: {total_steps} | warmup steps: {warmup_steps}")
 
@@ -243,27 +239,31 @@ def train():
     best_ckpt    = os.path.join(CONFIG["checkpoint_dir"], CONFIG["best_model_name"])
     history      = []
 
-    latest_ckpt = find_latest_checkpoint(CONFIG["checkpoint_dir"], prefix="v4_epoch_")
+    latest_ckpt = find_latest_checkpoint(CONFIG["checkpoint_dir"], prefix="v5_epoch_")
 
     if latest_ckpt:
-        print(f"[train] found v4 checkpoint: {latest_ckpt}")
+        print(f"[train] found v5 checkpoint: {latest_ckpt}")
         resumed_epoch, resumed_mae = load_checkpoint(latest_ckpt, model)
-        # NOTE: we do NOT restore optimizer/scheduler state here —
-        # we just added a new parameter group (backbone) so the old
-        # optimizer state is incompatible. Fresh optimizer is correct.
         start_epoch  = resumed_epoch + 1
         best_val_mae = resumed_mae
 
         if os.path.exists(best_ckpt):
             best_data    = torch.load(best_ckpt, map_location="cpu")
             best_val_mae = min(best_val_mae, best_data["val_mae"])
-            print(f"[train] best v4 val MAE so far: {best_val_mae:.4f}")
+            print(f"[train] best v5 val MAE so far: {best_val_mae:.4f}")
+
+        # fast-forward scheduler to the correct position
+        steps_done = resumed_epoch * len(train_loader)
+        print(f"[train] fast-forwarding scheduler {steps_done} steps (epoch 1-{resumed_epoch})...")
+        for _ in range(steps_done):
+            scheduler.step()
+        print(f"[train] scheduler ready at step {steps_done}/{total_steps}")
 
         if start_epoch > CONFIG["epochs"]:
             print(f"[train] already completed {CONFIG['epochs']} epochs.")
             return history
     else:
-        print(f"[train] no v4 checkpoint found — starting from scratch")
+        print(f"[train] no v5 checkpoint found — starting from scratch")
         v3_path = os.path.join(CONFIG["checkpoint_dir"], "best_model.pt")
         if os.path.exists(v3_path):
             print(f"[train] v3 best_model.pt preserved at {v3_path} ✓")
@@ -272,13 +272,7 @@ def train():
 
     for epoch in range(start_epoch, CONFIG["epochs"] + 1):
 
-        # --- Unfreeze backbone at unfreeze_epoch ---
-        if epoch == CONFIG["unfreeze_epoch"]:
-            for param in model.deberta.parameters():
-                param.requires_grad = True
-            counts = model.count_parameters()
-            print(f"[train] backbone unfrozen at epoch {epoch} — lr={CONFIG['backbone_lr']}")
-            print(f"[train] trainable params now: {counts['trainable']:,}")
+        
 
         print(f"{'='*50}")
         print(f"epoch {epoch}/{CONFIG['epochs']}")
@@ -295,7 +289,7 @@ def train():
             print(f"    {col:<25} {val_mae[col]:.4f}")
 
         if epoch % CONFIG["save_every"] == 0:
-            ckpt_path = os.path.join(CONFIG["checkpoint_dir"], f"v4_epoch_{epoch:02d}.pt")
+            ckpt_path = os.path.join(CONFIG["checkpoint_dir"], f"v5_epoch_{epoch:02d}.pt")
             save_checkpoint(model, optimizer, scheduler, epoch, val_mae["mean_mae"], ckpt_path)
 
         if val_mae["mean_mae"] < best_val_mae:
@@ -318,7 +312,7 @@ def train():
     print(f"v3 model:     checkpoints/best_model.pt  (untouched)")
     print(f"{'='*50}\n")
 
-    summary_path = os.path.join(CONFIG["checkpoint_dir"], "training_summary_v4.txt")
+    summary_path = os.path.join(CONFIG["checkpoint_dir"], "training_summary_v5.txt")
     save_summary(history, summary_path)
     return history
 
@@ -331,7 +325,7 @@ def save_summary(history, path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         f.write("=" * 50 + "\n")
-        f.write("BANDIT TRAINING SUMMARY — v4\n")
+        f.write("BANDIT TRAINING SUMMARY — v5\n")
         f.write("=" * 50 + "\n\n")
 
         f.write("CONFIG\n")
@@ -368,11 +362,6 @@ def save_summary(history, path):
 
     print(f"[train] summary saved → {path}")
 
-
-# ------------------------------------------------------------------
-# Entry point
-# python src/train.py
-# ------------------------------------------------------------------
 
 if __name__ == "__main__":
     history = train()
