@@ -40,3 +40,6 @@ class ErrorDetail(BaseModel):
 
 class ErrorResponse(BaseModel):
     error: ErrorDetail
+
+class FeedbackResponse(BaseModel):
+    feedback: str

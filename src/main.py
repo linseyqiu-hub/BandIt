@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from core.lifespan import lifespan
-from routers import scoring
+from routers import scoring, feedback
 
 
 # ------------------------------------------------------------------
@@ -42,6 +42,7 @@ app.add_middleware(
 # ------------------------------------------------------------------
 
 app.include_router(scoring.router)
+app.include_router(feedback.router)
 
 # Future routers added here when ready:
 # app.include_router(feedback.router)

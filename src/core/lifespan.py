@@ -1,43 +1,58 @@
+"""
+BandIt app lifespan
+Loads all heavy resources once at startup, stores on app.state,
+releases on shutdown.
+
+app.state:
+    inference_engine  — BandItInferenceEngine (DeBERTa scorer)
+    embedding_model   — SentenceTransformer (MiniLM, for RAG retrieval)
+    essays_col        — ChromaDB collection handle (essay embeddings)
+    questions_col     — ChromaDB collection handle (question embeddings)
+"""
+
+import os
 from contextlib import asynccontextmanager
 
+import chromadb
 from fastapi import FastAPI
+from sentence_transformers import SentenceTransformer
 
-from core.config import CHECKPOINT_PATH
+from core.config import MODEL_PATH, CHROMA_DB_PATH
 from inference import BandItInferenceEngine
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    FastAPI lifespan context manager.
+    # ------------------------------------------------------------------ #
+    # STARTUP                                                              #
+    # ------------------------------------------------------------------ #
 
-    Everything before `yield` runs at startup.
-    Everything after `yield` runs at shutdown.
+    # 1. scoring model
+    print("[lifespan] loading BandIt inference engine...")
+    app.state.inference_engine = BandItInferenceEngine(MODEL_PATH)
+    print("[lifespan] inference engine ready ✓")
 
-    The engine is stored on app.state so every request handler
-    can access it via request.app.state.engine — no globals needed.
+    # 2. embedding model (for RAG retrieval)
+    print("[lifespan] loading embedding model (all-MiniLM-L6-v2)...")
+    app.state.embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+    print("[lifespan] embedding model ready ✓")
 
-    Why app.state and not a module-level global?
-        Globals make testing hard — you can't easily swap in a
-        mock engine. app.state is scoped to one FastAPI instance,
-        so tests can create a fresh app with a fake engine.
-    """
+    # 3. ChromaDB collections
+    print(f"[lifespan] connecting to ChromaDB at {CHROMA_DB_PATH}...")
+    chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+    app.state.essays_col    = chroma_client.get_collection("essays",    embedding_function=None)
+    app.state.questions_col = chroma_client.get_collection("questions", embedding_function=None)
+    print(f"[lifespan] essays    count: {app.state.essays_col.count()} ✓")
+    print(f"[lifespan] questions count: {app.state.questions_col.count()} ✓")
 
-    # --- Startup ---
-    print("[lifespan] starting up ...")
+    print("[lifespan] all resources loaded — app ready\n")
 
-    # BandItInferenceEngine.__init__ loads the model and tokenizer.
-    # This takes ~3-5s on first run (tokenizer downloads vocab if not cached).
-    # It runs exactly once. All requests share this one loaded engine.
-    app.state.engine = BandItInferenceEngine(CHECKPOINT_PATH)
+    yield
 
-    print("[lifespan] engine ready. serving requests.")
-
-    yield  # server is live here — handles requests until shutdown signal
-
-    # --- Shutdown ---
-    # Free the model from memory explicitly.
-    # On CPU this is less critical, but good practice.
-    print("[lifespan] shutting down ...")
-    del app.state.engine
-    print("[lifespan] engine released.")
+    # ------------------------------------------------------------------ #
+    # SHUTDOWN                                                             #
+    # ------------------------------------------------------------------ #
+    print("[lifespan] shutting down...")
+    # SentenceTransformer and ChromaDB have no explicit close — GC handles it
+    # BandItInferenceEngine — same
+    print("[lifespan] shutdown complete")
