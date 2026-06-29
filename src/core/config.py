@@ -34,7 +34,9 @@ LABEL_COLUMNS = [
 # We go up two levels to reach the project root, then into checkpoints/.
 # This works regardless of where you run the server from.
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-CHECKPOINT_PATH = os.path.join(_PROJECT_ROOT, "checkpoints", "best_model.pt")
+CHECKPOINT_PATH = os.path.join(_PROJECT_ROOT, "checkpoints", "best_model_v5.pt")
+MODEL_PATH = CHECKPOINT_PATH  # alias — lifespan.py imports this name
+CHROMA_DB_PATH = os.path.join(_PROJECT_ROOT, "data", "chroma")
 
 
 # ------------------------------------------------------------------

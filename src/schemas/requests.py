@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-
+from schemas.responses import Scores
 
 class ScoreRequest(BaseModel):
     """
@@ -11,3 +11,10 @@ class ScoreRequest(BaseModel):
     """
     question: str
     essay: str
+
+
+class FeedbackRequest(BaseModel):
+    question: str
+    essay:    str
+    scores:   Scores
+    tone:     str = "coaching"   # default coaching, override with "strict"

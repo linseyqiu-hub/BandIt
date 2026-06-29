@@ -11,7 +11,7 @@ from anthropic import Anthropic
 # Constants
 # ---------------------------------------------------------------------------
 CLAUDE_MODEL    = "claude-sonnet-4-6"
-MAX_TOKENS      = 600       # ~4 paragraphs x 3-4 sentences
+MAX_TOKENS      = 350       # ~4 paragraphs x 3-4 sentences
 RRF_K           = 60        # standard RRF constant
 RETRIEVE_N      = 10        # candidates per collection before fusion
 FINAL_N         = 3         # few-shot examples after RRF
@@ -80,15 +80,15 @@ TONE_INSTRUCTIONS = {
 def build_prompt(
     question:          str,
     essay:             str,
-    scores:            dict,
+    scores,
     examiner_comments: list[str],
     tone:              str,
 ) -> str:
-    tr      = scores["Task_Response"]
-    cc      = scores["Coherence_Cohesion"]
-    lr      = scores["Lexical_Resource"]
-    ra      = scores["Range_Accuracy"]
-    overall = scores["Overall"]
+    tr      = scores.task_response
+    cc      = scores.coherence_cohesion
+    lr      = scores.lexical_resource
+    ra      = scores.grammatical_range_accuracy
+    overall = scores.overall
 
     few_shots = "\n\n".join(
         f"[{i+1}] Overall: {comment['overall']}\n    {comment['text']}"
@@ -121,11 +121,11 @@ band score.
 
 ## Task
 {tone_instruction}
-Write criterion-aligned feedback for this essay structured as exactly four
-paragraphs in this order: Task Response, Coherence and Cohesion, Lexical
-Resource, Grammatical Range and Accuracy.
-Each paragraph should be 3-4 sentences and specific to the essay above.
-Do not use headers. Do not repeat the band scores in your feedback.\
+Write feedback as a single cohesive paragraph of 6-8 sentences.
+Address all four criteria (Task Response, Coherence and Cohesion, Lexical
+Resource, Grammatical Range and Accuracy) in order.
+Ground your feedback to the essay content. Do not use headers or lists.
+Do not repeat the band scores in your feedback.\
 """
 
 # ---------------------------------------------------------------------------
@@ -134,7 +134,7 @@ Do not use headers. Do not repeat the band scores in your feedback.\
 def generate_feedback(
     question:    str,
     essay:       str,
-    scores:      dict,
+    scores,
     tone:        str,
     app_state,               # carries embedding_model, essays_col, questions_col
 ) -> str:

@@ -24,7 +24,7 @@ async def score(request: Request, body: ScoreRequest) -> ScoreResponse:
 
     All validation and business logic lives in services/scoring.py.
     """
-    engine = request.app.state.engine
+    engine = request.app.state.inference_engine
 
     return score_essay(
         question = body.question,
