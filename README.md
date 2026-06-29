@@ -38,27 +38,6 @@ Extends the platform to IELTS Speaking evaluation.
 
 
 
-## Running Locally
-
-**Backend**
-```bash
-cd BandIt
-uvicorn src.main:app --reload
-# API available at http://localhost:8000
-# Docs at http://localhost:8000/docs
-```
-
-**Frontend**
-```bash
-cd BandIt/frontend
-npm run dev
-# UI available at http://localhost:5173
-```
-
----
-
-
-
 ## Acknowledgements
 
 Base model: [microsoft/deberta-v3-base](https://huggingface.co/microsoft/deberta-v3-base)
