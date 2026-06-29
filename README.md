@@ -30,8 +30,6 @@ Extends the platform to IELTS Speaking evaluation.
 
 **Regression to the mean.** Because training data is centered around band 6–7, the model under-penalises essays at the extremes — particularly very weak essays. It correctly identifies relative quality differences across criteria but compresses absolute scores toward the middle of the band range.
 
-**No question context in v1.** The first model version scored essays without grounding in the question prompt. This has been corrected in the current version — question and essay are both provided as input.
-
 **CPU inference only.** No GPU required. Suitable for demo and small-scale use.
 
 ---
