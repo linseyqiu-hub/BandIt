@@ -19,6 +19,7 @@ import pandas as pd
 import chromadb
 from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
+from core.scoring_utils import compute_band_bin
 
 # ---------------------------------------------------------------------------
 # Config
@@ -28,18 +29,6 @@ DEFAULT_DB     = os.path.join("data", "chroma")
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 BATCH           = 500
 
-# ---------------------------------------------------------------------------
-# Band bin — same 4-bin stratification used in dataset.py
-# ---------------------------------------------------------------------------
-def compute_band_bin(overall: float) -> str:
-    if overall < 5.0:
-        return "poor"
-    elif overall < 6.5:
-        return "developing"
-    elif overall < 8.0:
-        return "competent"
-    else:
-        return "expert"
 
 # ---------------------------------------------------------------------------
 # Embed helper
