@@ -38,6 +38,7 @@ from sentence_transformers import SentenceTransformer
 
 from common import log_failure, log_fix, count_jsonl
 from preflight import run_preflight
+from rate_limit import RateLimiter, with_backoff
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
@@ -635,7 +636,7 @@ def score_faithfulness(case, feedback_text, arm_label):
     case_id = case["id"]
     n_failures = 0
 
-    raw_claims = judge_gemini(decompose_claims_prompt(feedback_text))
+    raw_claims = judge_gemini_safe(decompose_claims_prompt(feedback_text))
     claims, ok = parse_claims(raw_claims)
     if not ok:
         log_failure("judge_parse", case_id, f"claim decomposition unparseable ({arm_label})", raw_claims)
@@ -647,7 +648,7 @@ def score_faithfulness(case, feedback_text, arm_label):
 
     claim_scores = []
     for claim in claims:
-        raw = judge_gemini(faithfulness_judge_prompt(case, claim))
+        raw = judge_gemini_safe(faithfulness_judge_prompt(case, claim))
         score, ok = parse_score(raw)
         if not ok:
             log_failure("judge_parse", case_id, f"faithfulness claim score unparseable ({arm_label})", raw)
@@ -660,6 +661,56 @@ def score_faithfulness(case, feedback_text, arm_label):
         return None, n_failures
 
     return sum(claim_scores) / len(claim_scores), n_failures
+
+
+
+CHECKPOINT_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(TEST_QUESTIONS_PATH)), "logs", "run_ragas_checkpoint.jsonl"
+)
+
+
+def load_checkpoint(path):
+    """
+    Loads previously-completed case results from a JSONL checkpoint file.
+    Returns (results: list[dict], completed_ids: set[str]).
+
+    Tolerates a corrupted/incomplete final line -- e.g. if the process
+    died mid-write on the very last entry -- by skipping any line that
+    doesn't parse as valid JSON, rather than failing the whole load and
+    losing every prior completed case over one bad line.
+    """
+    results = []
+    completed_ids = set()
+    if not os.path.exists(path):
+        return results, completed_ids
+
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue  # partial/corrupted last line -- skip, don't crash the resume
+            results.append(row)
+            completed_ids.add(row["id"])
+
+    return results, completed_ids
+
+
+def append_checkpoint(path, row):
+    """
+    Appends one completed case's result to the checkpoint file immediately,
+    forcing it to disk (flush + fsync) rather than trusting OS write
+    buffering -- so a crash right after this case still has it persisted,
+    not sitting unflushed in a buffer that dies with the process.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
 
 
 # ---------------------------------------------------------------------------
@@ -677,55 +728,76 @@ def run():
 
     known_bad_ids = run_preflight(all_held_out_ids, essays_collection, questions_collection)
 
-    results = []
+    # --- resume from checkpoint, if one exists from a prior interrupted run ---
+    results, completed_ids = load_checkpoint(CHECKPOINT_PATH)
+    if completed_ids:
+        print(f"[resume] found checkpoint with {len(completed_ids)} already-completed cases -- skipping those")
+
     n_excluded_leak = 0
     n_judge_parse_failures = 0
+    n_case_crashes = 0
 
     for case in test_cases:
+        if case["id"] in completed_ids:
+            continue  # already done in a previous (interrupted) run
+
         exemplars, excluded = retrieve_with_leak_check(case, known_bad_ids)
         if excluded:
             n_excluded_leak += 1
             continue
 
-        variant_A = generate_groq(prompt_with_exemplars(case, exemplars))  # with exemplars
-        variant_B = generate_groq(prompt_zero_shot(case))                  # ablation, zero-shot
+        # A case's work is wrapped so an unhandled failure mid-case (e.g. a
+        # connection drop from the laptop waking from sleep, or any other
+        # transient issue with_backoff didn't already recover from) skips
+        # just THIS case rather than crashing the whole run. The case is
+        # NOT written to the checkpoint, so it's naturally retried on the
+        # next run -- same resume mechanism as a full-process crash, just
+        # scoped to one case instead of losing everything after it.
+        try:
+            variant_A = generate_groq_safe(prompt_with_exemplars(case, exemplars))  # with exemplars
+            variant_B = generate_groq_safe(prompt_zero_shot(case))                  # ablation, zero-shot
 
-        # --- faithfulness: per-claim, judged separately per arm. Whole
-        # point of the ablation is comparing the two, so they're never
-        # blended into one number. ---
-        faithfulness_with_exemplars, n_fail_A = score_faithfulness(case, variant_A, "with_exemplars")
-        n_judge_parse_failures += n_fail_A
+            # --- faithfulness: per-claim, judged separately per arm. ---
+            faithfulness_with_exemplars, n_fail_A = score_faithfulness(case, variant_A, "with_exemplars")
+            n_judge_parse_failures += n_fail_A
 
-        faithfulness_zero_shot, n_fail_B = score_faithfulness(case, variant_B, "zero_shot")
-        n_judge_parse_failures += n_fail_B
+            faithfulness_zero_shot, n_fail_B = score_faithfulness(case, variant_B, "zero_shot")
+            n_judge_parse_failures += n_fail_B
 
-        # --- context_precision: custom style-relevance prompt, 3
-        # independent binary criteria in one call. Scored on the retrieved
-        # exemplar set itself, not tied to either generation arm. ---
-        raw_precision = judge_gemini(context_precision_judge_prompt(case, exemplars))
-        verdicts, ok = parse_precision_verdicts(raw_precision)
-        if not ok:
-            log_failure("judge_parse", case["id"], "context_precision verdicts unparseable", raw_precision)
-            n_judge_parse_failures += 1
-            precision_relevant = precision_independent = precision_useful = precision_composite_score = None
-        else:
-            precision_relevant = verdicts["relevant"]["score"]
-            precision_independent = verdicts["independent"]["score"]
-            precision_useful = verdicts["useful"]["score"]
-            precision_composite_score = precision_composite(verdicts)
+            # --- context_precision: 3 independent binary criteria in one call ---
+            raw_precision = judge_gemini_safe(context_precision_judge_prompt(case, exemplars))
+            verdicts, ok = parse_precision_verdicts(raw_precision)
+            if not ok:
+                log_failure("judge_parse", case["id"], "context_precision verdicts unparseable", raw_precision)
+                n_judge_parse_failures += 1
+                precision_relevant = precision_independent = precision_useful = precision_composite_score = None
+            else:
+                precision_relevant = verdicts["relevant"]["score"]
+                precision_independent = verdicts["independent"]["score"]
+                precision_useful = verdicts["useful"]["score"]
+                precision_composite_score = precision_composite(verdicts)
 
-        results.append({
-            "id": case["id"],
-            "band_bin": case["band_bin"],
-            "faithfulness_with_exemplars": faithfulness_with_exemplars,
-            "faithfulness_zero_shot": faithfulness_zero_shot,
-            "context_precision_relevant": precision_relevant,
-            "context_precision_independent": precision_independent,
-            "context_precision_useful": precision_useful,
-            "context_precision_composite": precision_composite_score,
-            "variant_A": variant_A,
-            "variant_B": variant_B,
-        })
+            row = {
+                "id": case["id"],
+                "band_bin": case["band_bin"],
+                "faithfulness_with_exemplars": faithfulness_with_exemplars,
+                "faithfulness_zero_shot": faithfulness_zero_shot,
+                "context_precision_relevant": precision_relevant,
+                "context_precision_independent": precision_independent,
+                "context_precision_useful": precision_useful,
+                "context_precision_composite": precision_composite_score,
+                "variant_A": variant_A,
+                "variant_B": variant_B,
+            }
+        except Exception as exc:
+            n_case_crashes += 1
+            log_failure("case_crash", case["id"], f"{type(exc).__name__}: {exc}", None)
+            print(f"[SKIPPED] case {case['id']} failed ({type(exc).__name__}: {exc}) -- will retry next run")
+            continue
+
+        results.append(row)
+        append_checkpoint(CHECKPOINT_PATH, row)  # persist THIS case immediately, before moving to the next
+        print(f"[progress] case {case['id']} done ({len(results)}/{len(test_cases)})")
 
     write_results(results, n_excluded_leak, n_judge_parse_failures, len(test_cases))
 
