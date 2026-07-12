@@ -16,8 +16,13 @@ Pipeline (locked design, see design doc):
               REPLACES metadata wholesale rather than merging into it.
 
 Schema notes (per the real ingest.py):
-    - CSV columns are capitalized: Question, Essay, Examiner_Comment, Overall
-    - `Overall` is the raw float score (multiples of 0.5 in [1.0, 9.0])
+    - CSV columns are capitalized: Question, Essay, Examiner_Comment, Overall,
+      Task_Response, Coherence_Cohesion, Lexical_Resource,
+      Grammatical_Range_Accuracy
+    - `Overall` and the four criterion sub-scores are all raw floats,
+      multiples of 0.5 in [1.0, 9.0] -- same validation rule applies to all
+      five, since IELTS bands every criterion (and the overall) on the same
+      half-point 1-9 scale.
     - `band_bin` is NOT a CSV column -- it's derived from Overall via
       compute_band_bin() into one of: poor / developing / competent / expert.
       Stratification here uses that same derived category, computed the
@@ -54,6 +59,18 @@ import chromadb  # noqa: E402
 # Config
 # ---------------------------------------------------------------------------
 
+# CSV column name -> output JSON key, for the four criterion sub-scores.
+# Kept as an explicit map (rather than a .lower() transform) so a future
+# CSV rename doesn't silently break output keys that run_ragas.py relies on.
+SUBSCORE_COLUMNS = {
+    "Task_Response": "task_response",
+    "Coherence_Cohesion": "coherence_cohesion",
+    "Lexical_Resource": "lexical_resource",
+    "Range_Accuracy": "grammatical_range_accuracy",  # CSV col is Range_Accuracy;
+    # JSON key kept as grammatical_range_accuracy to match build_prompt's
+    # scores.grammatical_range_accuracy attribute name.
+}
+
 CONFIG = {
     "dataset_path": PROJECT_ROOT / "data" / "ielts_relabeled_v3.csv",  # matches ingest.py's DEFAULT_DATA
     "target_n": 45,
@@ -85,10 +102,12 @@ CONFIG = {
 def load_dataset(path):
     """
     Loads the relabeled IELTS dataset. Real columns per ingest.py:
-    Question, Essay, Examiner_Comment, Overall. Adds a synthetic 'id' if
-    the CSV doesn't already have one -- ingest.py itself just uses row
-    index as string id, so we match that convention for consistency with
-    what's already in Chroma.
+    Question, Essay, Examiner_Comment, Overall, plus the four criterion
+    sub-score columns (Task_Response, Coherence_Cohesion, Lexical_Resource,
+    Grammatical_Range_Accuracy). Adds a synthetic 'id' if the CSV doesn't
+    already have one -- ingest.py itself just uses row index as string id,
+    so we match that convention for consistency with what's already in
+    Chroma.
     """
     df = pd.read_csv(path)
     if "id" not in df.columns:
@@ -115,8 +134,11 @@ def get_collections():
 def verify_row(row, config):
     """
     Returns (ok: bool, reason: str or None). On success, sets
-    row['Overall'] to the normalized float and row['band_bin'] to the
-    derived category, so downstream code always sees clean values.
+    row['Overall'] to the normalized float, row['band_bin'] to the derived
+    category, and normalizes each of the four criterion sub-score columns
+    in place (same validation rule as Overall: multiple of 0.5 in
+    [1.0, 9.0]) -- so downstream code always sees clean values for all
+    five scores.
     """
     essay = (row.get("Essay") or "").strip()
     question = (row.get("Question") or "").strip()
@@ -141,6 +163,18 @@ def verify_row(row, config):
         return False, f"invalid Overall: {row.get('Overall')!r} (must be multiple of 0.5 in [1.0, 9.0])"
     row["Overall"] = normalized
     row["band_bin"] = compute_band_bin(normalized)
+
+    # Validate + normalize the four criterion sub-scores using the same
+    # rule as Overall (IELTS bands every criterion on the same 1-9,
+    # half-point scale).
+    for csv_col in SUBSCORE_COLUMNS:
+        ok, normalized_sub = validate_overall_score(row.get(csv_col))
+        if not ok:
+            return False, (
+                f"invalid {csv_col}: {row.get(csv_col)!r} "
+                f"(must be multiple of 0.5 in [1.0, 9.0])"
+            )
+        row[csv_col] = normalized_sub
 
     return True, None
 
@@ -281,14 +315,17 @@ def patch_held_out(selected_rows, essays_collection, questions_collection):
 def write_test_questions(selected_rows, config):
     out = []
     for row in selected_rows:
-        out.append({
+        item = {
             "id": row["id"],
             "question": row["Question"],
             "essay": row["Essay"],
             "reference": row["Examiner_Comment"],
             "overall": row["Overall"],
             "band_bin": row["band_bin"],
-        })
+        }
+        for csv_col, json_key in SUBSCORE_COLUMNS.items():
+            item[json_key] = row[csv_col]
+        out.append(item)
     with open(config["output_path"], "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2, ensure_ascii=False)
     print(f"[write] {len(out)} rows -> {config['output_path']}")
