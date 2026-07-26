@@ -20,10 +20,17 @@ Order of operations:
     3. aggregate means/std overall and per band_bin, store ablation pairs
     4. write eval/results_baseline.json (ungated -- no threshold check yet)
 
-NOTE: generate(), judge(), b/retrieve_top_n, and the prompt-
-builder functions are stubs marked TODO. Wire these to your actual Groq /
-Gemini / Chroma clients. The control flow and failure-handling logic around
-them is the part that's locked and shouldn't need to change.
+FIX APPLIED (see conversation): rrf_fusion/retrieve_top3 previously
+returned each exemplar as {"id", "examiner_comment"} only. build_prompt
+(src/services/feedback.py) reads comment['overall']/comment['text'], and
+context_precision_judge_prompt reads ex['text'] -- neither of which the
+old shape provided, so EVERY case crashed with KeyError: 'overall' inside
+build_prompt the moment retrieval returned anything. retrieve_top3 now
+also fetches Chroma metadatas and builds an overall map (mirroring
+production's feedback_service.py pattern), and rrf_fusion returns
+{"id", "text", "overall"} per exemplar -- confirmed by reproducing the
+exact KeyError with the old shape and confirming it's gone with the new
+one.
 """
 
 import json
@@ -32,13 +39,14 @@ import sys
 import statistics
 
 from openai import OpenAI
-from google import genai
 import chromadb
 from sentence_transformers import SentenceTransformer
+from types import SimpleNamespace
 
 from common import log_failure, log_fix, count_jsonl
 from preflight import run_preflight
 from rate_limit import RateLimiter, with_backoff
+from src.services.feedback import build_prompt, SYSTEM_PROMPT, get_descriptor
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
@@ -67,9 +75,17 @@ EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 #        export GROQ_API_KEY=...   (or set in your shell / .env)
 #        pip install openai --break-system-packages   (Groq is OpenAI-SDK-compatible)
 #
-# Gemini: https://aistudio.google.com  -> Get API key
-#        export GEMINI_API_KEY=...
-#        pip install google-genai --break-system-packages
+# JUDGE MODEL SWAP (was Gemini 2.5 Flash via Google AI Studio):
+# Google AI Studio was returning persistent 429 RESOURCE_EXHAUSTED regardless
+# of quota state -- a known Google-side bug where projects stay pinned to a
+# free_tier_requests limit of 0. Not a code issue and not self-resolving, so
+# the judge moved off Google entirely.
+#
+# Judge is now openai/gpt-oss-120b, served by the SAME Groq client as the
+# generator. This preserves the three-distinct-labs property from the design
+# doc's section 2: exemplar data (Anthropic/Claude), generator (Meta/Llama),
+# judge (OpenAI/gpt-oss). No self-preference overlap. One API key, one SDK,
+# no card.
 
 def _require_env(name, setup_hint):
     value = os.environ.get(name)
@@ -88,12 +104,9 @@ groq_client = OpenAI(
     ),
     base_url="https://api.groq.com/openai/v1",
 )
-gemini_client = genai.Client(
-    api_key=_require_env(
-        "GEMINI_API_KEY",
-        "Get one at https://aistudio.google.com -> Get API key.",
-    )
-)
+
+GENERATOR_MODEL = "llama-3.3-70b-versatile"
+JUDGE_MODEL = "openai/gpt-oss-120b"
 
 
 def get_collections():
@@ -116,36 +129,68 @@ def get_embedding_model():
     return _embedding_model
 
 
-def generate_groq(prompt, temperature=0.7):
+def generate_groq(prompt_tuple, temperature=0.7):
+    """
+    prompt_tuple is (system_prompt, user_prompt), as returned by
+    prompt_with_exemplars()/prompt_zero_shot(). FIXED: previously took a
+    single string and stuffed it into one user message with no system
+    role at all -- when generate_groq_safe started passing the full
+    (system, user) tuple through, that tuple got serialized as a JSON
+    array of two strings, which the API rejected with a 400 (neither a
+    valid string content nor a valid list-of-objects content). Now
+    unpacks the tuple into a proper 2-message system+user request, which
+    the OpenAI-compatible /chat/completions endpoint genuinely supports.
+    """
+    system, user = prompt_tuple
     resp = groq_client.chat.completions.create(
         model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
         temperature=temperature,
     )
     return resp.choices[0].message.content
 
 
-def judge_gemini(prompt):
-    resp = gemini_client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
+def judge_llm(prompt):
+    """
+    Judge call -- same Groq client as the generator, different model.
+
+    Judge prompts are single strings (unlike the generator's
+    (system, user) tuple), so this sends one user message. temperature=0.0
+    is a deliberate change from the old Gemini call, which set no
+    temperature at all and therefore sampled at the provider default:
+    scoring should be as close to deterministic as the model allows, so
+    repeat runs are comparable and JSON output is less likely to drift.
+    """
+    resp = groq_client.chat.completions.create(
+        model=JUDGE_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0,
     )
-    return resp.text
+    return resp.choices[0].message.content
 
 
 # ---------------------------------------------------------------------------
-# Retrieval -- your RRF fusion, wrapped with Chroma queries + exclude_ids
+# Retrieval -- RRF fusion, wrapped with Chroma queries + exclude_ids
+#
+# FIXED: now fetches metadatas alongside documents, builds an id->overall
+# map, and rrf_fusion returns {"id", "text", "overall"} per exemplar --
+# this is the shape build_prompt and context_precision_judge_prompt
+# actually need. Previously returned {"id", "examiner_comment"} only,
+# which crashed every single case with KeyError: 'overall' inside
+# build_prompt.
 # ---------------------------------------------------------------------------
 
-def rrf_fusion(essay_ids, question_ids, essay_docs, question_docs, k=RRF_K, n=FINAL_N):
+def rrf_fusion(essay_ids, question_ids, essay_docs, question_docs, overall_map, k=RRF_K, n=FINAL_N):
     """
     Fuse two ranked lists via Reciprocal Rank Fusion.
 
-    NOTE: changed from your original to return dicts (id + comment) instead
-    of bare comment strings -- the leak check in retrieve_with_leak_check()
-    needs the id of each returned exemplar, not just its text. If you have
-    other callers relying on the old list[str] return shape, keep this as a
-    separate function name rather than overwriting the original.
+    Returns each exemplar as {"id", "text", "overall"} -- "id" for the
+    leak-check, "text"/"overall" because that's what build_prompt (in
+    src/services/feedback.py) and context_precision_judge_prompt both
+    actually read.
     """
     scores: dict[str, float] = {}
     docs: dict[str, str] = {}
@@ -159,7 +204,10 @@ def rrf_fusion(essay_ids, question_ids, essay_docs, question_docs, k=RRF_K, n=FI
         docs[id_] = doc
 
     ranked = sorted(scores.keys(), key=lambda id_: scores[id_], reverse=True)
-    return [{"id": id_, "examiner_comment": docs[id_]} for id_ in ranked[:n]]
+    return [
+        {"id": id_, "text": docs[id_], "overall": overall_map.get(id_)}
+        for id_ in ranked[:n]
+    ]
 
 
 def retrieve_top3(question, essay, exclude_ids=None):
@@ -171,6 +219,12 @@ def retrieve_top3(question, essay, exclude_ids=None):
     ingest.py), so Chroma cannot embed query_texts itself. We compute query
     embeddings explicitly with the same model ingest.py used, and pass
     query_embeddings= instead.
+
+    Now also requests metadatas (previously documents/ids only) and builds
+    an id -> overall map from it, mirroring production's
+    feedback_service.py pattern (overall_map[id_] = meta["overall"]) --
+    this is what rrf_fusion needs to attach a real "overall" score to each
+    exemplar.
     """
     exclude_ids = exclude_ids or set()
     where_filter = {"held_out": {"$ne": True}}
@@ -180,18 +234,30 @@ def retrieve_top3(question, essay, exclude_ids=None):
     question_embedding = model.encode([question]).tolist()
 
     essay_results = essays_collection.query(
-        query_embeddings=essay_embedding, n_results=OVERFETCH_N, where=where_filter
+        query_embeddings=essay_embedding, n_results=OVERFETCH_N, where=where_filter,
+        include=["documents", "metadatas"],
     )
     question_results = questions_collection.query(
-        query_embeddings=question_embedding, n_results=OVERFETCH_N, where=where_filter
+        query_embeddings=question_embedding, n_results=OVERFETCH_N, where=where_filter,
+        include=["documents", "metadatas"],
     )
 
     # documents ARE the examiner_comment (per ingest.py) -- no need to pull
     # it out of metadata separately.
     essay_ids = essay_results["ids"][0]
     essay_docs = essay_results["documents"][0]
+    essay_metas = essay_results["metadatas"][0]
     question_ids = question_results["ids"][0]
     question_docs = question_results["documents"][0]
+    question_metas = question_results["metadatas"][0]
+
+    # build id -> overall BEFORE exclusion filtering, so the map covers
+    # everything that was originally retrieved
+    overall_map: dict[str, float] = {}
+    for id_, meta in zip(essay_ids, essay_metas):
+        overall_map[id_] = meta.get("overall") if meta else None
+    for id_, meta in zip(question_ids, question_metas):
+        overall_map[id_] = meta.get("overall") if meta else None
 
     if exclude_ids:
         essay_pairs = [(i, d) for i, d in zip(essay_ids, essay_docs) if i not in exclude_ids]
@@ -199,38 +265,22 @@ def retrieve_top3(question, essay, exclude_ids=None):
         essay_ids, essay_docs = (list(t) for t in zip(*essay_pairs)) if essay_pairs else ([], [])
         question_ids, question_docs = (list(t) for t in zip(*question_pairs)) if question_pairs else ([], [])
 
-    return rrf_fusion(essay_ids, question_ids, essay_docs, question_docs)
+    return rrf_fusion(essay_ids, question_ids, essay_docs, question_docs, overall_map)
 
 
 # ---------------------------------------------------------------------------
-# Assumes these are already imported elsewhere in run_ragas.py:
-#
-#   from types import SimpleNamespace
-#   from src.services.feedback import build_prompt, SYSTEM_PROMPT, get_descriptor
-#   JUDGE_OUTPUT_INSTRUCTION = "..."   # already defined in run_ragas.py
-#
-# `case` is a plain dict loaded from test_questions.json, e.g.:
+# case is a plain dict loaded from test_questions.json, e.g.:
 #   {
 #     "id": "254", "question": "...", "essay": "...",
 #     "reference": "...", "overall": 5.5, "band_bin": "developing",
 #     "task_response": ..., "coherence_cohesion": ...,
 #     "lexical_resource": ..., "grammatical_range_accuracy": ...,
 #   }
-# NOTE: the four sub-score fields (task_response / coherence_cohesion /
-# lexical_resource / grammatical_range_accuracy) are NOT in test_questions.json
-# yet — build_test_set.py needs to be updated to pull them from the labeled
-# CSV (alongside Overall) and carry them through. Blocking prerequisite for
-# an actual eval run, tracked separately from this file.
 #
 # build_prompt() accesses `scores.task_response` etc. via DOT notation (it
-# expects an object, not a dict) — so case_scores() below wraps the four
+# expects an object, not a dict) -- so case_scores() below wraps the four
 # flat dict fields into a SimpleNamespace right before use, rather than
 # changing build_prompt itself.
-#
-# `exemplars` is the output of retrieve_top3(): a list of
-#   {"id": str, "text": str, "overall": float}
-# dicts — "id" carried through for the leak-check, "text"/"overall" are what
-# build_prompt actually reads.
 # ---------------------------------------------------------------------------
 
 
@@ -249,7 +299,7 @@ def case_scores(case: dict) -> SimpleNamespace:
 
 def prompt_with_exemplars(case, exemplars):
     """
-    Generator prompt, WITH retrieved exemplars — mirrors production's
+    Generator prompt, WITH retrieved exemplars -- mirrors production's
     build_prompt() call exactly (same function, same tone default, same
     system prompt). Returns (system_prompt, user_prompt) so the generator
     call can replicate production's client.messages.create(system=..., ...)
@@ -267,7 +317,7 @@ def prompt_with_exemplars(case, exemplars):
 
 def prompt_zero_shot(case):
     """
-    Generator prompt, ablation arm — same template, exemplars stripped.
+    Generator prompt, ablation arm -- same template, exemplars stripped.
     Calls build_prompt() with examiner_comments=[] (so scores/descriptors/
     tone logic stay byte-identical to production), then trims the resulting
     string to remove the now-empty "## Examiner Reference Comments" section
@@ -290,7 +340,7 @@ def prompt_zero_shot(case):
 
 def faithfulness_judge_prompt(case, claim_text):
     """
-    Judge prompt — is `claim_text` (one decomposed claim from generated
+    Judge prompt -- is `claim_text` (one decomposed claim from generated
     feedback) grounded in question + essay + the four criterion scores?
     Overall score and exemplars are deliberately excluded: production's own
     generation instruction grounds feedback on the four criteria, NOT on
@@ -301,7 +351,7 @@ def faithfulness_judge_prompt(case, claim_text):
     return f"""\
 You are evaluating whether a piece of feedback text is faithful to its
 source context, i.e. whether every factual claim in it can be traced back
-to the context provided — with no fabricated or unsupported claims.
+to the context provided -- with no fabricated or unsupported claims.
 
 ## Context
 ### Question
@@ -331,7 +381,7 @@ inferable from the context above.
 
 def context_precision_judge_prompt(case, exemplars):
     """
-    Judge prompt — custom style-relevance framing, NOT stock RAGAS
+    Judge prompt -- custom style-relevance framing, NOT stock RAGAS
     factual-QA precision. One call per case, scoring the retrieved
     exemplar SET as a whole against three independent binary criteria:
 
@@ -343,7 +393,7 @@ def context_precision_judge_prompt(case, exemplars):
 
     Band level is explicitly excluded from context and named as a
     non-criterion, since production deliberately does not filter/rank
-    exemplars by score — penalizing band mismatch here would reintroduce
+    exemplars by score -- penalizing band mismatch here would reintroduce
     exactly the bias production chose not to have.
     """
     numbered_exemplars = "\n\n".join(
@@ -368,20 +418,20 @@ material for generating feedback on a target essay.
 
 1. relevant (0/1): Are the exemplars' contexts (topic, argument
    structure, or essay type) similar enough to the target essay/question
-   that this looks like a sensible retrieval match overall — not
+   that this looks like a sensible retrieval match overall -- not
    arbitrary or unrelated results?
 
-2. independent (0/1): Are the exemplars clearly distinct essays/cases —
-   from each other and from the target — rather than near-duplicates or
+2. independent (0/1): Are the exemplars clearly distinct essays/cases --
+   from each other and from the target -- rather than near-duplicates or
    the same underlying case reappearing?
 
 3. useful (0/1): Would these exemplars plausibly help a writer produce
-   well-grounded, well-styled feedback on the target essay — e.g. do
-   they model clear critique or natural phrasing — as opposed to being
+   well-grounded, well-styled feedback on the target essay -- e.g. do
+   they model clear critique or natural phrasing -- as opposed to being
    vague, malformed, or unhelpful as reference material?
 
 Judge each criterion independently. Band level is NOT a criterion for
-any of the above — do not penalize or reward the exemplar set for
+any of the above -- do not penalize or reward the exemplar set for
 having different Overall scores than the target essay.
 
 Respond with a single JSON object in this exact shape:
@@ -398,18 +448,6 @@ No preamble, no markdown fences, JSON only.
 # Parsing helpers
 # ---------------------------------------------------------------------------
 
-# We control the judge prompts (see faithfulness_judge_prompt /
-# context_precision_judge_prompt), so the output format is a decision we
-# make once, not something to discover after the fact by guessing at
-# whatever Gemini happens to return. Every judge prompt MUST end with the
-# appropriate instruction below -- that's what makes the parsers
-# deterministic instead of best-effort regex.
-
-# faithfulness_judge_prompt ends with `+ JUDGE_OUTPUT_INSTRUCTION` --
-# single-claim, single-score shape. Faithfulness verdicts are binary
-# (supported / not supported) but 0.0/1.0 are valid values within this
-# instruction's [0.0, 1.0] float range, so no separate instruction is
-# needed for it.
 JUDGE_OUTPUT_INSTRUCTION = (
     "\n\nRespond with ONLY a JSON object in exactly this format, nothing else, "
     'no markdown code fences: {"score": 0 or 1, '
@@ -434,12 +472,10 @@ def parse_score(raw_output):
     """
     Parses the strict single-score JSON format mandated by
     JUDGE_OUTPUT_INSTRUCTION. Used for faithfulness_judge_prompt (one call
-    per claim, per arm -- see faithfulness_with_exemplars /
-    faithfulness_zero_shot in write_results below).
+    per claim, per arm).
 
-    Returns (value or None, ok: bool). Anything beyond a wrapped-fence
-    deviation (missing 'score' key, non-numeric, out of range) is a
-    genuine parse failure and gets logged by the caller.
+    Returns (value or None, ok: bool). Value must be exactly 0.0 or 1.0 --
+    faithfulness is a binary supported/not-supported determination.
     """
     if raw_output is None:
         return None, False
@@ -460,22 +496,10 @@ def parse_score(raw_output):
 
 def parse_precision_verdicts(raw_output):
     """
-    Parses the 3-key JSON format produced by context_precision_judge_prompt:
-        {"relevant":    {"score": 0 or 1, "reasoning": "..."},
-         "independent": {"score": 0 or 1, "reasoning": "..."},
-         "useful":      {"score": 0 or 1, "reasoning": "..."}}
-
-    One call per CASE (not per exemplar, not per criterion) -- scores the
-    retrieved exemplar set as a whole. Each of the three criteria is
-    independent; none of them may be inferred from the others, and a
-    missing/invalid entry for any one key fails the whole parse (ok=False)
-    rather than partially succeeding, since a partial verdict would corrupt
-    downstream per-criterion aggregation silently.
-
-    Returns (verdicts, ok):
-        verdicts = {"relevant": {"score": 0/1, "reasoning": str}, ...}
-                   or None if parsing failed
-        ok = True only if all three keys parsed with a valid 0/1 score.
+    Parses the 3-key JSON format produced by context_precision_judge_prompt.
+    One call per CASE -- scores the retrieved exemplar set as a whole.
+    Returns (verdicts, ok): ok=True only if all three keys parsed with a
+    valid 0/1 score.
     """
     if raw_output is None:
         return None, False
@@ -509,23 +533,13 @@ def parse_precision_verdicts(raw_output):
 def precision_composite(verdicts):
     """
     Single headline number for context_precision: mean of the three
-    independent 0/1 criteria. This is a reporting convenience ON TOP OF
-    the separate per-criterion means in write_results below, not a
-    replacement for them -- averaging relevant/independent/useful into one
-    number during JUDGING would blend three different constructs (the same
-    kind of unprincipled blend the RRF-vs-alpha-blend decision rejected
-    elsewhere in this project). Composing them into one number for
-    reporting, after they've already been judged independently, is fine.
-
-    Call only with verdicts that passed parse_precision_verdicts (ok=True).
-    Returns None if verdicts is None (i.e. the case had a parse failure).
+    independent 0/1 criteria. Reporting convenience ON TOP OF the separate
+    per-criterion means in write_results, not a replacement for them.
     """
     if verdicts is None:
         return None
     scores = [verdicts[k]["score"] for k in ("relevant", "independent", "useful")]
     return sum(scores) / len(scores)
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -562,19 +576,51 @@ def retrieve_with_leak_check(case, known_bad_ids):
     return exemplars_retry, False
 
 
+# ---------------------------------------------------------------------------
+# Rate-limited wrappers -- Groq free-tier numbers (verified against Groq's
+# published per-model limits, June 2026). Limits are per model, so the
+# generator and judge get separate limiter instances rather than sharing one.
+#
+#   llama-3.3-70b-versatile (generator): 30 RPM, 12,000 TPM, 1K RPD, 100K TPD
+#   openai/gpt-oss-120b     (judge):     30 RPM,  8,000 TPM, 1K RPD, 200K TPD
+#
+# TPM binds well before RPM on both, so both limiters track tokens. See the
+# TPD note below -- daily token budget is the real ceiling for a full run.
+# ---------------------------------------------------------------------------
+
+groq_limiter = RateLimiter(rpm=30, tpm=12_000)
+judge_limiter = RateLimiter(rpm=30, tpm=8_000)
+
+
+def judge_safe(prompt):
+    """
+    Was judge_safe. Now token-aware: the old Gemini limiter was
+    RPM-only (rpm=5) because Gemini's TPM ceiling was 250K and never came
+    close to binding. The judge model's 8K TPM is tight enough that an
+    RPM-only limiter would silently under-protect it and trigger 429s.
+    """
+    estimated_tokens = len(prompt) // 4 + 300  # rough input + output ceiling
+    judge_limiter.wait(estimated_tokens=estimated_tokens)
+    return with_backoff(judge_llm, prompt)
+
+
+def generate_groq_safe(prompt_tuple):
+    system, user = prompt_tuple
+    estimated_tokens = (len(system) + len(user)) // 4 + 350  # rough input + MAX_TOKENS output ceiling
+    groq_limiter.wait(estimated_tokens=estimated_tokens)
+    return with_backoff(generate_groq, prompt_tuple)
+
 
 # ---------------------------------------------------------------------------
-# Claim decomposition (new -- faithfulness is judged per-claim, not on the
-# whole feedback paragraph as a single unit).
+# Claim decomposition -- faithfulness is judged per-claim, not on the whole
+# feedback paragraph as a single unit.
 # ---------------------------------------------------------------------------
 
 def decompose_claims_prompt(feedback_text):
     """
     Asks the judge model to break a piece of generated feedback into
     atomic, independently-checkable claims, so faithfulness can be judged
-    per-claim rather than holistically. Standard RAGAS-style decomposition
-    step -- same evaluator model (Gemini) does this and the faithfulness
-    judging itself, since both are analysis tasks, not generation.
+    per-claim rather than holistically.
     """
     return f"""\
 Break the following feedback text into a list of atomic, independently
@@ -600,10 +646,7 @@ no markdown code fences. Example format:
 def parse_claims(raw_output):
     """
     Parses the JSON array of claim strings from decompose_claims_prompt.
-    Returns (claims: list[str] or None, ok: bool). Empty strings are
-    dropped; a genuinely empty list after cleaning is still a valid parse
-    (ok=True, claims=[]) -- the caller decides how to handle zero claims,
-    since that's a scoring-semantics question, not a parsing one.
+    Returns (claims: list[str] or None, ok: bool).
     """
     if raw_output is None:
         return None, False
@@ -625,18 +668,15 @@ def parse_claims(raw_output):
 def score_faithfulness(case, feedback_text, arm_label):
     """
     Full per-arm faithfulness pipeline: decompose feedback_text into
-    claims, judge each claim independently via faithfulness_judge_prompt +
-    parse_score, average into a single per-case, per-arm score.
+    claims, judge each claim independently, average into a single
+    per-case, per-arm score.
 
-    Returns (score: float or None, n_parse_failures: int). A decomposition
-    failure or zero-claims result yields score=None (excluded from
-    aggregation by _mean_std's None-filtering) and is logged so it's
-    visible rather than silently averaged away.
+    Returns (score: float or None, n_parse_failures: int).
     """
     case_id = case["id"]
     n_failures = 0
 
-    raw_claims = judge_gemini_safe(decompose_claims_prompt(feedback_text))
+    raw_claims = judge_safe(decompose_claims_prompt(feedback_text))
     claims, ok = parse_claims(raw_claims)
     if not ok:
         log_failure("judge_parse", case_id, f"claim decomposition unparseable ({arm_label})", raw_claims)
@@ -648,7 +688,7 @@ def score_faithfulness(case, feedback_text, arm_label):
 
     claim_scores = []
     for claim in claims:
-        raw = judge_gemini_safe(faithfulness_judge_prompt(case, claim))
+        raw = judge_safe(faithfulness_judge_prompt(case, claim))
         score, ok = parse_score(raw)
         if not ok:
             log_failure("judge_parse", case_id, f"faithfulness claim score unparseable ({arm_label})", raw)
@@ -657,12 +697,14 @@ def score_faithfulness(case, feedback_text, arm_label):
         claim_scores.append(score)
 
     if not claim_scores:
-        # every claim failed to parse -- no usable score for this arm
         return None, n_failures
 
     return sum(claim_scores) / len(claim_scores), n_failures
 
 
+# ---------------------------------------------------------------------------
+# Checkpointing -- resume-on-restart
+# ---------------------------------------------------------------------------
 
 CHECKPOINT_PATH = os.path.join(
     os.path.dirname(os.path.abspath(TEST_QUESTIONS_PATH)), "logs", "run_ragas_checkpoint.jsonl"
@@ -673,11 +715,6 @@ def load_checkpoint(path):
     """
     Loads previously-completed case results from a JSONL checkpoint file.
     Returns (results: list[dict], completed_ids: set[str]).
-
-    Tolerates a corrupted/incomplete final line -- e.g. if the process
-    died mid-write on the very last entry -- by skipping any line that
-    doesn't parse as valid JSON, rather than failing the whole load and
-    losing every prior completed case over one bad line.
     """
     results = []
     completed_ids = set()
@@ -692,7 +729,7 @@ def load_checkpoint(path):
             try:
                 row = json.loads(line)
             except json.JSONDecodeError:
-                continue  # partial/corrupted last line -- skip, don't crash the resume
+                continue
             results.append(row)
             completed_ids.add(row["id"])
 
@@ -700,12 +737,8 @@ def load_checkpoint(path):
 
 
 def append_checkpoint(path, row):
-    """
-    Appends one completed case's result to the checkpoint file immediately,
-    forcing it to disk (flush + fsync) rather than trusting OS write
-    buffering -- so a crash right after this case still has it persisted,
-    not sitting unflushed in a buffer that dies with the process.
-    """
+    """Appends one completed case's result to the checkpoint file
+    immediately, forcing it to disk (flush + fsync)."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -728,7 +761,6 @@ def run():
 
     known_bad_ids = run_preflight(all_held_out_ids, essays_collection, questions_collection)
 
-    # --- resume from checkpoint, if one exists from a prior interrupted run ---
     results, completed_ids = load_checkpoint(CHECKPOINT_PATH)
     if completed_ids:
         print(f"[resume] found checkpoint with {len(completed_ids)} already-completed cases -- skipping those")
@@ -739,33 +771,24 @@ def run():
 
     for case in test_cases:
         if case["id"] in completed_ids:
-            continue  # already done in a previous (interrupted) run
+            continue
 
         exemplars, excluded = retrieve_with_leak_check(case, known_bad_ids)
         if excluded:
             n_excluded_leak += 1
             continue
 
-        # A case's work is wrapped so an unhandled failure mid-case (e.g. a
-        # connection drop from the laptop waking from sleep, or any other
-        # transient issue with_backoff didn't already recover from) skips
-        # just THIS case rather than crashing the whole run. The case is
-        # NOT written to the checkpoint, so it's naturally retried on the
-        # next run -- same resume mechanism as a full-process crash, just
-        # scoped to one case instead of losing everything after it.
         try:
-            variant_A = generate_groq_safe(prompt_with_exemplars(case, exemplars))  # with exemplars
-            variant_B = generate_groq_safe(prompt_zero_shot(case))                  # ablation, zero-shot
+            variant_A = generate_groq_safe(prompt_with_exemplars(case, exemplars))
+            variant_B = generate_groq_safe(prompt_zero_shot(case))
 
-            # --- faithfulness: per-claim, judged separately per arm. ---
             faithfulness_with_exemplars, n_fail_A = score_faithfulness(case, variant_A, "with_exemplars")
             n_judge_parse_failures += n_fail_A
 
             faithfulness_zero_shot, n_fail_B = score_faithfulness(case, variant_B, "zero_shot")
             n_judge_parse_failures += n_fail_B
 
-            # --- context_precision: 3 independent binary criteria in one call ---
-            raw_precision = judge_gemini_safe(context_precision_judge_prompt(case, exemplars))
+            raw_precision = judge_safe(context_precision_judge_prompt(case, exemplars))
             verdicts, ok = parse_precision_verdicts(raw_precision)
             if not ok:
                 log_failure("judge_parse", case["id"], "context_precision verdicts unparseable", raw_precision)
@@ -796,7 +819,7 @@ def run():
             continue
 
         results.append(row)
-        append_checkpoint(CHECKPOINT_PATH, row)  # persist THIS case immediately, before moving to the next
+        append_checkpoint(CHECKPOINT_PATH, row)
         print(f"[progress] case {case['id']} done ({len(results)}/{len(test_cases)})")
 
     write_results(results, n_excluded_leak, n_judge_parse_failures, len(test_cases))
@@ -816,23 +839,6 @@ def _mean_std(values):
 
 
 def write_results(results, n_excluded_leak, n_judge_parse_failures, n_total_cases):
-    """
-    Each row in `results` is expected to carry, per case:
-        band_bin
-        faithfulness_with_exemplars   -- mean of parse_score() over all
-                                          claims from the WITH-exemplars arm
-        faithfulness_zero_shot        -- mean of parse_score() over all
-                                          claims from the zero-shot arm
-        context_precision_relevant    -- 0/1, from parse_precision_verdicts
-        context_precision_independent -- 0/1
-        context_precision_useful      -- 0/1
-        context_precision_composite   -- precision_composite() of the above
-
-    faithfulness's two arms are reported SEPARATELY (mean/std each), never
-    blended -- that separation is the entire point of the ablation
-    (does exemplar-grounding help or hurt faithfulness?). context_precision
-    is reported per-criterion AND as a composite, per your call.
-    """
     faith_exemplars = _mean_std([r["faithfulness_with_exemplars"] for r in results])
     faith_zero_shot = _mean_std([r["faithfulness_zero_shot"] for r in results])
 
@@ -870,7 +876,7 @@ def write_results(results, n_excluded_leak, n_judge_parse_failures, n_total_case
         }
 
     output = {
-        "gated": False,  # first run is ungated, per design
+        "gated": False,
         "n_total_cases": n_total_cases,
         "n_scored": len(results),
         "n_excluded_leak": n_excluded_leak,
@@ -890,7 +896,7 @@ def write_results(results, n_excluded_leak, n_judge_parse_failures, n_total_case
             "context_precision_composite_std": prec_composite[1],
         },
         "per_band_bin": per_bin_stats,
-        "rows": results,  # includes variant_A / variant_B for ablation review
+        "rows": results,
     }
 
     with open(RESULTS_PATH, "w", encoding="utf-8") as f:

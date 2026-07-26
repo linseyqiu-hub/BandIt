@@ -1,0 +1,23 @@
+{
+  "gated": false,
+  "n_total_cases": 46,
+  "n_scored": 0,
+  "n_excluded_leak": 0,
+  "n_judge_parse_failures": 0,
+  "overall": {
+    "faithfulness_with_exemplars_mean": null,
+    "faithfulness_with_exemplars_std": null,
+    "faithfulness_zero_shot_mean": null,
+    "faithfulness_zero_shot_std": null,
+    "context_precision_relevant_mean": null,
+    "context_precision_relevant_std": null,
+    "context_precision_independent_mean": null,
+    "context_precision_independent_std": null,
+    "context_precision_useful_mean": null,
+    "context_precision_useful_std": null,
+    "context_precision_composite_mean": null,
+    "context_precision_composite_std": null
+  },
+  "per_band_bin": {},
+  "rows": []
+}
