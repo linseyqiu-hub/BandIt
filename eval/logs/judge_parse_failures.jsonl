@@ -1,0 +1,1 @@
+{"timestamp": "2026-08-01T20:59:29.342990+00:00", "stage": "judge_parse", "case_id": "615", "reason": "faithfulness claim score unparseable (with_exemplars)", "payload": "{\"score\": 1, \"reasoning\": \"The essay explicitly states 'Overall, there are 3 main steps of processing...'}"}
