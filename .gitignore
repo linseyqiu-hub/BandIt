@@ -11,3 +11,5 @@ __pycache__/
 
 # Anaconda
 *.egg-info/
+env_dump.json
+.env

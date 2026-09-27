@@ -1,0 +1,41 @@
+# BandIt — API serving dependencies
+#
+# Only what the FastAPI process imports at runtime.
+# Training, ingest and eval dependencies live in requirements-dev.txt
+# and are deliberately NOT installed into the container image.
+#
+# Verified: every pin below resolves with a Linux cp313 wheel.
+
+# --- torch: CPU-only build -------------------------------------------------
+# The default PyPI wheel is the CUDA build (~2GB of nvidia-* packages this
+# app never touches). The +cpu local version identifier and PyTorch's own
+# index pin us to the CPU wheel explicitly, so pip cannot silently resolve
+# back to the CUDA build.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.12.0+cpu
+
+# --- web layer -------------------------------------------------------------
+fastapi==0.136.3
+uvicorn[standard]==0.48.0
+pydantic==2.13.4
+
+# --- models ----------------------------------------------------------------
+transformers==5.8.1
+sentencepiece==0.2.1
+sentence-transformers==5.6.0
+
+# --- vector store client ---------------------------------------------------
+# chromadb-client, NOT chromadb: Chroma runs as its own container, so the API
+# is a pure HTTP client. The full server package pulls 28 runtime deps
+# (onnxruntime, kubernetes, grpcio, ...) against the client's 14.
+chromadb-client==1.5.9
+
+# --- external APIs ---------------------------------------------------------
+anthropic==0.104.0
+
+# --- numerics --------------------------------------------------------------
+numpy==2.3.5
+
+# Pulled in transitively, intentionally unpinned here:
+#   tokenizers, safetensors, huggingface_hub, starlette, httpx,
+#   scipy, scikit-learn (via sentence-transformers)

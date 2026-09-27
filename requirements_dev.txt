@@ -1,0 +1,21 @@
+# BandIt — local development, training, ingest and eval dependencies
+#
+# Install locally with:  pip install -r requirements-dev.txt
+# NEVER installed into the API container image.
+#
+# Inherits every serving pin so local and container versions stay identical.
+-r requirements.txt
+
+# --- training (src/train.py, src/dataset.py) -------------------------------
+pandas==2.3.3
+scikit-learn          # was conda-installed locally, so no pin to carry over
+matplotlib==3.10.6
+
+# --- ingest (src/scripts/ingest.py) ----------------------------------------
+# Full chromadb, not the client: ingest may run against a local
+# PersistentClient as well as the server.
+chromadb==1.5.9
+
+# --- eval harness (eval/) --------------------------------------------------
+openai==2.44.0
+google-genai==2.10.0
