@@ -6,18 +6,17 @@ releases on shutdown.
 app.state:
     inference_engine  — BandItInferenceEngine (DeBERTa scorer)
     embedding_model   — SentenceTransformer (MiniLM, for RAG retrieval)
-    essays_col        — ChromaDB collection handle (essay embeddings)
-    questions_col     — ChromaDB collection handle (question embeddings)
+    chroma_client     — ChromaDB HttpClient (vector search)
 """
 
 import os
 from contextlib import asynccontextmanager
 
-import chromadb
+from chromadb import HttpClient
 from fastapi import FastAPI
 from sentence_transformers import SentenceTransformer
 
-from core.config import MODEL_PATH, CHROMA_DB_PATH
+from core.config import CHROMA_HOST, CHROMA_PORT
 from inference import BandItInferenceEngine
 
 
@@ -29,7 +28,7 @@ async def lifespan(app: FastAPI):
 
     # 1. scoring model
     print("[lifespan] loading BandIt inference engine...")
-    app.state.inference_engine = BandItInferenceEngine(MODEL_PATH)
+    app.state.inference_engine = BandItInferenceEngine()
     print("[lifespan] inference engine ready ✓")
 
     # 2. embedding model (for RAG retrieval)
@@ -37,13 +36,24 @@ async def lifespan(app: FastAPI):
     app.state.embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
     print("[lifespan] embedding model ready ✓")
 
-    # 3. ChromaDB collections
-    print(f"[lifespan] connecting to ChromaDB at {CHROMA_DB_PATH}...")
-    chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-    app.state.essays_col    = chroma_client.get_collection("essays",    embedding_function=None)
-    app.state.questions_col = chroma_client.get_collection("questions", embedding_function=None)
-    print(f"[lifespan] essays    count: {app.state.essays_col.count()} ✓")
-    print(f"[lifespan] questions count: {app.state.questions_col.count()} ✓")
+    # 3. ChromaDB — retry loop because Chroma may still be starting
+    import time
+    print(f"[lifespan] connecting to ChromaDB at {CHROMA_HOST}:{CHROMA_PORT}...")
+    client = None
+    for attempt in range(15):
+        try:
+            client = HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
+            client.heartbeat()
+            break
+        except Exception:
+            wait = min(2 ** attempt * 0.5, 8)   # 0.5, 1, 2, 4, 8, 8, ...
+            print(f"[lifespan] chroma not ready, retry in {wait:.1f}s (attempt {attempt + 1}/15)")
+            time.sleep(wait)
+    if client is None:
+        raise RuntimeError("ChromaDB not reachable after 15 attempts")
+
+    app.state.chroma_client = client
+    print(f"[lifespan] chroma connected ✓")
 
     print("[lifespan] all resources loaded — app ready\n")
 
