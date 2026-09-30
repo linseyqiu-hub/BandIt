@@ -5,6 +5,7 @@ collections, then calls Claude API to generate criterion-aligned feedback.
 """
 
 import os
+from core.chroma import get_collections
 from anthropic import Anthropic
 
 # ---------------------------------------------------------------------------
@@ -150,12 +151,14 @@ def generate_feedback(
     question_emb = embedding_model.encode([question]).tolist()
 
     # --- 2. query ---
-    essay_results = app_state.essays_col.query(
+    essays_col, questions_col = get_collections(app_state)
+
+    essay_results = essays_col.query(
         query_embeddings=essay_emb,
         n_results=RETRIEVE_N,
         include=["documents", "metadatas"],
     )
-    question_results = app_state.questions_col.query(
+    question_results = questions_col.query(
         query_embeddings=question_emb,
         n_results=RETRIEVE_N,
         include=["documents", "metadatas"],

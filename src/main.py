@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from core.config import MODEL_NAME
+from core.config import MODEL_NAME, CORS_ORIGINS
 from core.lifespan import lifespan
 from routers import scoring, feedback
 
@@ -29,10 +29,9 @@ app = FastAPI(
 # ------------------------------------------------------------------
 
 # Allows the React frontend (Week 3) to call this API from the browser.
-# origins=["*"] is fine for local dev — tighten this before production.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins     = ["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials = True,
     allow_methods     = ["*"],
     allow_headers     = ["*"],
@@ -105,7 +104,7 @@ async def ready():
     # Chroma lives in another container; any failure to reach it is a
     # failed check, not a 500 from this endpoint.
     try:
-        app.state.essays_col.count()
+        app.state.chroma_client.heartbeat()
         checks["chroma"] = True
     except Exception:
         checks["chroma"] = False
