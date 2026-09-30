@@ -6,19 +6,8 @@ from transformers import DebertaV2Tokenizer
 
 from model import BandItScorer
 
+from core.config import MODEL_NAME, MAX_LENGTH, LABEL_COLUMNS, MODEL_REPO, MODEL_VERSION
 
-# ------------------------------------------------------------------
-# Constants — must match dataset.py exactly
-# ------------------------------------------------------------------
-
-MODEL_NAME    = "microsoft/deberta-v3-base"
-MAX_LENGTH    = 512
-LABEL_COLUMNS = [
-    "Task_Response",
-    "Coherence_Cohesion",
-    "Lexical_Resource",
-    "Range_Accuracy",
-]
 
 
 # ------------------------------------------------------------------
@@ -27,10 +16,7 @@ LABEL_COLUMNS = [
 
 def load_model(checkpoint_path: str, device: torch.device) -> BandItScorer:
     """
-    Loads BandItScorer v4 from a checkpoint.
-
-    v4 checkpoint is best_model_v4.pt — distinct from v3's best_model.pt.
-    Both can coexist in checkpoints/.
+    Loads BandItScorer from a checkpoint file on disk.
     """
     print(f"[inference] loading model from {checkpoint_path} ...")
 
@@ -173,8 +159,18 @@ class BandItInferenceEngine:
     Pass checkpoint_path="checkpoints/best_model.pt" to use v3 instead.
     """
 
-    def __init__(self, checkpoint_path: str = "checkpoints/best_model_v4.pt"):
-        self.device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    def __init__(self, checkpoint_path: str | None = None):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        if checkpoint_path is None:
+            from huggingface_hub import hf_hub_download
+            checkpoint_path = hf_hub_download(
+                repo_id=MODEL_REPO,
+                filename="model.pt",
+                revision=MODEL_VERSION,
+                token=os.environ.get("HF_TOKEN"),
+            )
+
         self.model     = load_model(checkpoint_path, self.device)
         self.tokenizer = load_tokenizer()
         print(f"[BandItInferenceEngine] ready.")
@@ -205,7 +201,7 @@ class BandItInferenceEngine:
 
 if __name__ == "__main__":
 
-    CHECKPOINT = "checkpoints/best_model_v4.pt"
+    CHECKPOINT = "checkpoints/best_model_v5.pt"
 
     if not os.path.exists(CHECKPOINT):
         print(f"[inference] checkpoint not found at {CHECKPOINT}")
