@@ -16,9 +16,6 @@ RRF_K           = 60        # standard RRF constant
 RETRIEVE_N      = 10        # candidates per collection before fusion
 FINAL_N         = 3         # few-shot examples after RRF
 
-DESCRIPTORS = {
-    # maps Overall/sub-score float → band descriptor string
-}
 
 def get_descriptor(score: float) -> str:
     if score <= 4.5:
