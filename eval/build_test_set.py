@@ -50,10 +50,10 @@ PROJECT_ROOT = SCRIPT_DIR.parent               # D:\BandIt
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from src.core.config import CHROMA_DB_PATH  # noqa: E402
+from src.core.config import CHROMA_HOST, CHROMA_PORT  # noqa: E402
 from src.core.scoring_utils import VALID_OVERALL_SCORES, validate_overall_score, compute_band_bin  # noqa: E402
 
-import chromadb  # noqa: E402
+from chromadb import HttpClient
 
 # ---------------------------------------------------------------------------
 # Config
@@ -116,12 +116,8 @@ def load_dataset(path):
 
 
 def get_collections():
-    """
-    Matches ingest.py's client setup exactly: PersistentClient at
-    CHROMA_DB_PATH, embedding_function=None on both collections (embeddings
-    are supplied explicitly, never computed by Chroma itself).
-    """
-    client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+    """Connects to Chroma server — same instance the API and ingest use."""
+    client = HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
     essays_collection = client.get_collection("essays", embedding_function=None)
     questions_collection = client.get_collection("questions", embedding_function=None)
     return essays_collection, questions_collection

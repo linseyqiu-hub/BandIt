@@ -39,7 +39,7 @@ import sys
 import statistics
 
 from openai import OpenAI
-import chromadb
+from chromadb import HttpClient
 from sentence_transformers import SentenceTransformer
 from types import SimpleNamespace
 
@@ -52,7 +52,7 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from core.config import CHROMA_DB_PATH  # noqa: E402
+from core.config import CHROMA_HOST, CHROMA_PORT 
 
 TEST_QUESTIONS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_questions.json")
 RESULTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results_baseline.json")
@@ -110,8 +110,8 @@ JUDGE_MODEL = "openai/gpt-oss-120b"
 
 
 def get_collections():
-    """Matches ingest.py's client setup exactly."""
-    client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+    """Connects to Chroma server — same instance the API uses."""
+    client = HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
     essays_collection = client.get_collection("essays", embedding_function=None)
     questions_collection = client.get_collection("questions", embedding_function=None)
     return essays_collection, questions_collection

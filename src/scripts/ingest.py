@@ -8,16 +8,16 @@ At query time, the returned document IS the examiner_comment (few-shot payload).
 Embeddings are computed explicitly via sentence-transformers (all-MiniLM-L6-v2).
 
 Usage:
-    python src/scripts/ingest.py
-    python src/scripts/ingest.py --data data/ielts_relabeled_v3.csv --db data/chroma
+    python src/scripts/ingest.py --data data/ielts_relabeled_v3.csv
+    python src/scripts/ingest.py --data data/ielts_relabeled_v3.csv --host chroma --port 8000
 """
 
 import os
 import sys
 import argparse
 import pandas as pd
-import chromadb
-from chromadb.config import Settings
+from chromadb import HttpClient
+from core.config import CHROMA_HOST, CHROMA_PORT
 from sentence_transformers import SentenceTransformer
 from core.scoring_utils import compute_band_bin
 
@@ -25,7 +25,6 @@ from core.scoring_utils import compute_band_bin
 # Config
 # ---------------------------------------------------------------------------
 DEFAULT_DATA   = os.path.join("data", "ielts_relabeled_v3.csv")
-DEFAULT_DB     = os.path.join("data", "chroma")
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 BATCH           = 500
 
@@ -39,7 +38,7 @@ def embed(model: SentenceTransformer, texts: list[str]) -> list[list[float]]:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def main(data_path: str, db_path: str) -> None:
+def main(data_path: str, chroma_host: str, chroma_port: int):
     # --- load ---
     print(f"Loading {data_path} ...")
     df = pd.read_csv(data_path)
@@ -75,9 +74,8 @@ def main(data_path: str, db_path: str) -> None:
     question_embeddings = embed(model, df["Question"].tolist())
 
     # --- ChromaDB ---
-    print(f"\nInitialising ChromaDB at {db_path} ...")
-    # disable chromadb's own embedding function — we provide embeddings explicitly
-    client = chromadb.PersistentClient(path=db_path)
+    print(f"\nConnecting to ChromaDB at {chroma_host}:{chroma_port} ...")
+    client = HttpClient(host=chroma_host, port=chroma_port)
 
     for name in ("essays", "questions"):
         try:
@@ -137,7 +135,8 @@ def main(data_path: str, db_path: str) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="BandIt ChromaDB ingest")
     parser.add_argument("--data", default=DEFAULT_DATA, help="Path to ielts_relabeled.csv")
-    parser.add_argument("--db",   default=DEFAULT_DB,   help="ChromaDB persistent directory")
+    parser.add_argument("--host", default=CHROMA_HOST, help="ChromaDB host")
+    parser.add_argument("--port", type=int, default=CHROMA_PORT, help="ChromaDB port")
     args = parser.parse_args()
 
-    main(args.data, args.db)
+    main(args.data, args.host, args.port)
