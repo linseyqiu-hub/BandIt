@@ -134,7 +134,7 @@ def generate_feedback(
     essay:       str,
     scores,
     tone:        str,
-    app_state,               # carries embedding_model, essays_col, questions_col
+    app_state,               # carries embedding_model, chroma_client
 ) -> str:
     """
     Full feedback pipeline:

@@ -240,7 +240,7 @@ if __name__ == "__main__":
     )
 
     print("=" * 50)
-    print("inference.py smoke test — v4")
+    print("inference.py smoke test — v5")
     print("=" * 50)
 
     print("\n--- Test 1: functional API ---")
