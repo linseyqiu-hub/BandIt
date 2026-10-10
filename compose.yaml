@@ -1,0 +1,75 @@
+# ============================================================
+# BandIt — compose.yaml
+# ============================================================
+#
+# Start:   docker compose up
+# Stop:    docker compose down       (keeps volumes)
+# Nuke:    docker compose down -v    (deletes volumes too)
+# Rebuild: docker compose up --build (rebuilds api image)
+# Logs:    docker compose logs -f api
+#
+# Three services on a private network:
+#   api    — your FastAPI app, the only published port
+#   chroma — vector search, official image
+#   redis  — rate limiter (placeholder, nothing uses it yet)
+#
+# Secrets (API keys, tokens) come from .env via env_file.
+# Service addresses are overridden in environment: so the
+# container sees "chroma" and "redis" instead of "localhost".
+# ============================================================
+
+
+services:
+
+  # ── API ──────────────────────────────────────────────────
+  api:
+    build: .
+    image: bandit-api
+    ports:
+      - "8000:8000"            # the one hole in the wall
+    env_file: .env             # secrets: ANTHROPIC_API_KEY, HF_TOKEN, etc.
+    environment:               # overrides for container environment
+      CHROMA_HOST: chroma      # DNS name on the compose network
+      CHROMA_PORT: 8000
+      REDIS_URL: redis://redis:6379/0
+      HF_HOME: /models         # overrides .env's .hf_cache
+      CORS_ORIGINS: "*"        # tighten in production
+    volumes:
+      - model-cache:/models    # HF downloads persist across restarts
+    depends_on:
+      chroma:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s        # first start downloads ~700MB from HF
+      retries: 3
+
+  # ── ChromaDB ─────────────────────────────────────────────
+  chroma:
+    image: chromadb/chroma
+    ports:
+      - "8001:8000"        # temporary, for ingest
+    volumes:
+      - chroma-data:/chroma/chroma   # collections persist across restarts
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/localhost/8000"]
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    # No ports: — only reachable from the compose network
+
+  # ── Redis (placeholder) ─────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    # No volumes — rate limit buckets refill naturally,
+    # losing them on restart is harmless.
+    # No ports: — only reachable from the compose network
+
+
+volumes:
+  model-cache:      # HF model downloads — survives container rebuilds
+  chroma-data:      # vector index — survives container rebuilds
