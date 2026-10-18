@@ -1,0 +1,28 @@
+# ============================================================
+# BandIt — .dockerignore (whitelist style)
+# ============================================================
+# Deny everything, then allow back ONLY what the Dockerfile
+# COPYs. Anything new that appears in the repo (a venv, a
+# dataset, a checkpoint, a .env) stays out of the build
+# context by default — no need to remember to add it here.
+#
+# If you add a new COPY line to the Dockerfile, add a
+# matching "!" line below or the build will fail with
+# "file not found".
+# ============================================================
+
+# 1. Deny everything
+*
+
+# 2. Allow back what the Dockerfile actually uses
+!requirements_prod.txt
+!src
+
+# 3. Re-exclude junk that could live inside src/
+src/**/__pycache__
+src/**/*.pyc
+src/**/*.pt
+src/**/*.pth
+src/**/*.safetensors
+src/**/.env
+src/**/.env.*

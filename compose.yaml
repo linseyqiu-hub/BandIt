@@ -49,11 +49,11 @@ services:
 
   # ── ChromaDB ─────────────────────────────────────────────
   chroma:
-    image: chromadb/chroma
+    image: chromadb/chroma:1.5.9
     ports:
       - "8001:8000"        # temporary, for ingest
     volumes:
-      - chroma-data:/chroma/chroma   # collections persist across restarts
+      - chroma-data:/data   # collections persist across restarts
     healthcheck:
       test: ["CMD", "bash", "-c", "echo > /dev/tcp/localhost/8000"]
       interval: 10s

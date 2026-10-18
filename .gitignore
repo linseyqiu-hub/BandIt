@@ -15,3 +15,7 @@ env_dump.json
 .env
 .hf_cache/
 chroma/
+
+#env
+env/*.env
+!env/config.env
