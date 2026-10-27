@@ -1,4 +1,4 @@
-from core.config import VALID_OVERALL_SCORES
+from core.constants import VALID_OVERALL_SCORES
 
 
 def validate_overall_score(value):

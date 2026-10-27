@@ -39,3 +39,6 @@ numpy==2.3.5
 # Pulled in transitively, intentionally unpinned here:
 #   tokenizers, safetensors, huggingface_hub, starlette, httpx,
 #   scipy, scikit-learn (via sentence-transformers)
+
+#------------pydantic settings------------------
+pydantic-settings==2.15.0

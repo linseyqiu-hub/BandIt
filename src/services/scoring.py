@@ -1,6 +1,6 @@
 from fastapi import HTTPException
 
-from core.config import (
+from core.constants import (
     ESSAY_MIN_WORDS,
     ESSAY_MAX_WORDS,
     QUESTION_MIN_CHARS,
