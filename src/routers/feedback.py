@@ -13,7 +13,12 @@ router = APIRouter()
 
 
 @router.post("/feedback", response_model=FeedbackResponse)
-async def feedback(request: Request, body: FeedbackRequest):
+def feedback(request: Request, body: FeedbackRequest):
+    # Plain `def`, not `async def`: generate_feedback makes BLOCKING calls
+    # (embedding, Chroma query, a multi-second Claude call). FastAPI runs a
+    # `def` endpoint on a worker thread, so the event loop stays free for
+    # other requests. Inside `async def` these calls would freeze the loop
+    # and serialize every request. (Planned: full async stack — see to-do.)
     try:
         feedback_text = generate_feedback(
             question  = body.question,

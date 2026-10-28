@@ -4,15 +4,14 @@ Retrieves similar examiner comments via RRF fusion across two ChromaDB
 collections, then calls Claude API to generate criterion-aligned feedback.
 """
 
-import os
 from core.chroma import get_collections
-from anthropic import Anthropic
 
 # ---------------------------------------------------------------------------
-# Constants
+# Retrieval algorithm parameters
 # ---------------------------------------------------------------------------
-CLAUDE_MODEL    = "claude-sonnet-4-6"
-MAX_TOKENS      = 350       # ~4 paragraphs x 3-4 sentences
+# These define HOW retrieval works, so they live in code. Which LLM to call
+# and its output budget are deployment config: LLMSettings (LLM_MODEL,
+# LLM_MAX_TOKENS), read via app_state.settings.llm.
 RRF_K           = 60        # standard RRF constant
 RETRIEVE_N      = 10        # candidates per collection before fusion
 FINAL_N         = 3         # few-shot examples after RRF
@@ -134,7 +133,7 @@ def generate_feedback(
     essay:       str,
     scores,
     tone:        str,
-    app_state,               # carries embedding_model, chroma_client
+    app_state,               # carries embedding_model, chroma_client, llm_client, settings
 ) -> str:
     """
     Full feedback pipeline:
@@ -206,13 +205,17 @@ def generate_feedback(
     user_prompt = build_prompt(question, essay, scores, examiner_comments, tone)
 
     # --- 5. call Claude API ---
-    client   = Anthropic()
+    # One shared client per process (built in lifespan): reuses pooled TLS
+    # connections instead of a fresh handshake per request. Thread-safe —
+    # this function runs on many worker threads at once.
+    client   = app_state.llm_client
+    llm      = app_state.settings.llm
     response = client.messages.create(
-        model      = CLAUDE_MODEL,
-        max_tokens = MAX_TOKENS,
+        model      = llm.llm_model,
+        max_tokens = llm.llm_max_tokens,
         system     = SYSTEM_PROMPT,
         messages   = [{"role": "user", "content": user_prompt}],
     )
 
     # --- 6. return ---
-    return response.content[0].text
+    return response.content[0].text 

@@ -9,7 +9,10 @@ router = APIRouter()
 
 
 @router.post("/score", response_model=ScoreResponse)
-async def score(request: Request, body: ScoreRequest) -> ScoreResponse:
+def score(request: Request, body: ScoreRequest) -> ScoreResponse:
+    # Plain `def`, not `async def`: model inference is BLOCKING, CPU-bound
+    # work. FastAPI runs a `def` endpoint on a worker thread, so the event
+    # loop stays free; inside `async def` it would freeze every request.
     """
     POST /score
 
