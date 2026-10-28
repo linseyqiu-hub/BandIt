@@ -12,21 +12,49 @@ Usage:
     python src/scripts/ingest.py --data data/ielts_relabeled_v3.csv --host chroma --port 8000
 """
 
+"""
+BandIt RAG ingest script
+Loads ielts_relabeled_v3.csv and populates two ChromaDB collections:
+  - essays:    embeddings from Essay text,    documents = Examiner_Comment
+  - questions: embeddings from Question text, documents = Examiner_Comment
+
+At query time, the returned document IS the examiner_comment (few-shot payload).
+Embeddings are computed explicitly via sentence-transformers (all-MiniLM-L6-v2).
+
+Where Chroma is (highest priority first):
+    1. --host / --port flags
+    2. CHROMA_HOST / CHROMA_PORT env vars (compose / ECS inject these)
+    3. env/config.env on the host
+    4. ChromaSettings defaults (localhost:8000)
+All four are resolved by ChromaSettings — the flags are simply passed in as
+constructor arguments, the highest-priority source pydantic-settings has.
+
+This job needs NO secrets: it loads only ChromaSettings.
+
+Usage:
+    python src/scripts/ingest.py
+    python src/scripts/ingest.py --data data/ielts_relabeled_v3.csv --host localhost --port 8001
+"""
+
 import os
 import sys
 import argparse
 import pandas as pd
 from chromadb import HttpClient
-from core.config import CHROMA_HOST, CHROMA_PORT
 from sentence_transformers import SentenceTransformer
+
+from core.constants import EMBEDDING_MODEL
 from core.scoring_utils import compute_band_bin
+from core.settings import ChromaSettings
+from pydantic import ValidationError
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-DEFAULT_DATA   = os.path.join("data", "ielts_relabeled_v3.csv")
-EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-BATCH           = 500
+DEFAULT_DATA = os.path.join("data", "ielts_relabeled_v3.csv")
+BATCH        = 500
+# EMBEDDING_MODEL comes from core.constants: the SAME constant serving and
+# eval query with. Vectors written here must match the vectors queried there.
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +67,14 @@ def embed(model: SentenceTransformer, texts: list[str]) -> list[list[float]]:
 # Main
 # ---------------------------------------------------------------------------
 def main(data_path: str, chroma_host: str, chroma_port: int):
+    # --- connect FIRST: fail fast ---
+    # Embedding the whole dataset takes minutes. Check Chroma is reachable
+    # before doing that work, not after.
+    print(f"Connecting to ChromaDB at {chroma_host}:{chroma_port} ...")
+    client = HttpClient(host=chroma_host, port=chroma_port)
+    client.heartbeat()
+    print("  ChromaDB reachable ✓\n")
+
     # --- load ---
     print(f"Loading {data_path} ...")
     df = pd.read_csv(data_path)
@@ -73,10 +109,8 @@ def main(data_path: str, chroma_host: str, chroma_port: int):
     print("\nEmbedding questions ...")
     question_embeddings = embed(model, df["Question"].tolist())
 
-    # --- ChromaDB ---
-    print(f"\nConnecting to ChromaDB at {chroma_host}:{chroma_port} ...")
-    client = HttpClient(host=chroma_host, port=chroma_port)
-
+    # --- ChromaDB: rebuild collections ---
+    print("\nRebuilding collections ...")
     for name in ("essays", "questions"):
         try:
             client.delete_collection(name)
@@ -135,8 +169,17 @@ def main(data_path: str, chroma_host: str, chroma_port: int):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="BandIt ChromaDB ingest")
     parser.add_argument("--data", default=DEFAULT_DATA, help="Path to ielts_relabeled.csv")
-    parser.add_argument("--host", default=CHROMA_HOST, help="ChromaDB host")
-    parser.add_argument("--port", type=int, default=CHROMA_PORT, help="ChromaDB port")
+    # default=None: "not given" must be distinguishable from a value, so that
+    # an omitted flag falls through to env vars / env/config.env / defaults.
+    parser.add_argument("--host", default=None, help="ChromaDB host (overrides CHROMA_HOST)")
+    parser.add_argument("--port", type=int, default=None, help="ChromaDB port (overrides CHROMA_PORT)")
     args = parser.parse_args()
 
-    main(args.data, args.host, args.port)
+    # Only flags actually given become constructor arguments (top priority).
+    overrides = {k: v for k, v in {"host": args.host, "port": args.port}.items() if v is not None}
+    try:
+        chroma = ChromaSettings(**overrides)
+    except ValidationError as exc:
+        sys.exit(f"invalid Chroma configuration (check CHROMA_HOST / CHROMA_PORT):\n{exc}")
+
+    main(args.data, chroma.host, chroma.port)
