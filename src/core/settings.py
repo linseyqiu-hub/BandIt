@@ -92,7 +92,7 @@ class LLMSettings(_GroupSettings):
 
     anthropic_api_key: NonEmptySecret           # ANTHROPIC_API_KEY — required
     llm_model: str = "claude-sonnet-4-6"        # LLM_MODEL
-    llm_max_tokens: int = 350                   # LLM_MAX_TOKENS
+    llm_max_tokens: int = 600                   # LLM_MAX_TOKENS
 
 
 class EvalLLMSettings(_GroupSettings):

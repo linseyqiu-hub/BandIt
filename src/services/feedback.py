@@ -5,6 +5,9 @@ collections, then calls Claude API to generate criterion-aligned feedback.
 """
 
 from core.chroma import get_collections
+import logging
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Retrieval algorithm parameters
@@ -118,7 +121,7 @@ band score.
 
 ## Task
 {tone_instruction}
-Write feedback as a single cohesive paragraph of 6-8 sentences.
+Write feedback as a single cohesive paragraph of about 180-220 words.
 Address all four criteria (Task Response, Coherence and Cohesion, Lexical
 Resource, Grammatical Range and Accuracy) in order.
 Ground your feedback to the essay content. Do not use headers or lists.
@@ -216,6 +219,11 @@ def generate_feedback(
         system     = SYSTEM_PROMPT,
         messages   = [{"role": "user", "content": user_prompt}],
     )
+    if response.stop_reason == "max_tokens":
+        logger.warning(
+            "feedback truncated: hit LLM_MAX_TOKENS=%d (output_tokens=%d)",
+            llm.llm_max_tokens, response.usage.output_tokens,
+        )
 
     # --- 6. return ---
     return response.content[0].text 

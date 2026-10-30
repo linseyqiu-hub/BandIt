@@ -9,6 +9,7 @@ from schemas.requests import FeedbackRequest
 from schemas.responses import FeedbackResponse
 from services.feedback import generate_feedback
 
+
 router = APIRouter()
 
 
