@@ -1,0 +1,2 @@
+  -r requirements_prod.txt
+  pandas==2.3.3
