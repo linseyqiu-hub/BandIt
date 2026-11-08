@@ -5,17 +5,22 @@
 # Start:   docker compose up
 # Stop:    docker compose down       (keeps volumes)
 # Nuke:    docker compose down -v    (deletes volumes too)
-# Rebuild: docker compose up --build (rebuilds api image)
+# Rebuild: docker compose up --build (rebuilds images)
 # Logs:    docker compose logs -f api
+# Ingest:  docker compose run --rm ingest
 #
-# Three services on a private network:
-#   api    — your FastAPI app, the only published port
-#   chroma — vector search, official image
+# Services on a private network:
+#   api    — FastAPI app, the ONLY published port
+#   chroma — vector search, official image, no published port
 #   redis  — rate limiter (placeholder, nothing uses it yet)
+#   ingest — one-off job (profile "tools"): fills Chroma from
+#            ./data, then exits. Skipped by plain "compose up".
 #
-# Secrets (API keys, tokens) come from .env via env_file.
-# Service addresses are overridden in environment: so the
-# container sees "chroma" and "redis" instead of "localhost".
+# Config comes from env/ (see env/config.env):
+#   env_file:    → the same per-concern files the host uses
+#   environment: → ONLY values that differ inside the network
+#                  (service DNS names instead of localhost)
+# HF_HOME is set in the Dockerfile, not here.
 # ============================================================
 
 
@@ -23,17 +28,20 @@ services:
 
   # ── API ──────────────────────────────────────────────────
   api:
-    build: .
+    build:
+      context: .
+      target: serving          # Dockerfile stage
     image: bandit-api
     ports:
       - "8000:8000"            # the one hole in the wall
-    env_file: .env             # secrets: ANTHROPIC_API_KEY, HF_TOKEN, etc.
-    environment:               # overrides for container environment
+    env_file:
+      - env/config.env         # non-secret config (committed)
+      - env/hf.env             # HF_TOKEN
+      - env/llm.env            # ANTHROPIC_API_KEY
+    environment:               # container-only overrides
       CHROMA_HOST: chroma      # DNS name on the compose network
-      CHROMA_PORT: 8000
+      CHROMA_PORT: 8000        # chroma's port INSIDE the network
       REDIS_URL: redis://redis:6379/0
-      HF_HOME: /models         # overrides .env's .hf_cache
-      CORS_ORIGINS: "*"        # tighten in production
     volumes:
       - model-cache:/models    # HF downloads persist across restarts
     depends_on:
@@ -47,13 +55,30 @@ services:
       start_period: 60s        # first start downloads ~700MB from HF
       retries: 3
 
+  # ── Ingest (one-off job) ─────────────────────────────────
+  ingest:
+    build:
+      context: .
+      target: ingest           # serving + pandas
+    image: bandit-ingest
+    profiles: [tools]          # only runs via "docker compose run"
+    env_file:
+      - env/config.env         # no secrets: loads ChromaSettings only
+    environment:
+      CHROMA_HOST: chroma
+      CHROMA_PORT: 8000
+    volumes:
+      - ./data:/app/data:ro    # CSV from the host, read-only
+      - model-cache:/models    # MiniLM cached once, shared with api
+    depends_on:
+      chroma:
+        condition: service_healthy
+
   # ── ChromaDB ─────────────────────────────────────────────
   chroma:
     image: chromadb/chroma:1.5.9
-    ports:
-      - "8001:8000"        # temporary, for ingest
     volumes:
-      - chroma-data:/data   # collections persist across restarts
+      - chroma-data:/data      # collections persist across restarts
     healthcheck:
       test: ["CMD", "bash", "-c", "echo > /dev/tcp/localhost/8000"]
       interval: 10s

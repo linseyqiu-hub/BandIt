@@ -16,6 +16,7 @@
 
 # 2. Allow back what the Dockerfile actually uses
 !requirements_prod.txt
+!requirements_ingest.txt
 !src
 
 # 3. Re-exclude junk that could live inside src/
