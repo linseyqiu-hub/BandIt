@@ -23,6 +23,15 @@
 # HF_HOME is set in the Dockerfile, not here.
 # ============================================================
 
+# Log rotation for every service. Docker's json-file driver has NO size
+# limit by default; this caps each container at 3 × 10 MB. The app itself
+# only writes to stderr — rotation happens here, in Docker, never in Python.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 
 services:
 
@@ -32,6 +41,7 @@ services:
       context: .
       target: serving          # Dockerfile stage
     image: bandit-api
+    logging: *default-logging
     ports:
       - "8000:8000"            # the one hole in the wall
     env_file:
@@ -61,6 +71,7 @@ services:
       context: .
       target: ingest           # serving + pandas
     image: bandit-ingest
+    logging: *default-logging
     profiles: [tools]          # only runs via "docker compose run"
     env_file:
       - env/config.env         # no secrets: loads ChromaSettings only
@@ -77,6 +88,7 @@ services:
   # ── ChromaDB ─────────────────────────────────────────────
   chroma:
     image: chromadb/chroma:1.5.9
+    logging: *default-logging
     volumes:
       - chroma-data:/data      # collections persist across restarts
     healthcheck:
@@ -90,6 +102,7 @@ services:
   # ── Redis (placeholder) ─────────────────────────────────
   redis:
     image: redis:7-alpine
+    logging: *default-logging
     # No volumes — rate limit buckets refill naturally,
     # losing them on restart is harmless.
     # No ports: — only reachable from the compose network

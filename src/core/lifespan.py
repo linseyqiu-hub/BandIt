@@ -40,6 +40,7 @@ Current resources on app.state:
 
 import asyncio
 from contextlib import asynccontextmanager
+import logging
 
 from anthropic import Anthropic
 from chromadb import HttpClient
@@ -51,6 +52,7 @@ from core.constants import EMBEDDING_MODEL
 from core.embedding import ThreadSafeEmbedder
 from inference import BandItInferenceEngine
 
+logger = logging.getLogger(__name__)
 
 CHROMA_CONNECT_ATTEMPTS = 15
 CHROMA_MAX_BACKOFF_S = 8.0
@@ -69,7 +71,7 @@ async def lifespan(app: FastAPI):
     # primary guard; the retry is the safety net.)
 
     # 1. scoring model — checkpoint source passed in from settings
-    print("[lifespan] loading BandIt inference engine...")
+    logger.info("loading inference engine")
     registry = settings.registry
     app.state.inference_engine = BandItInferenceEngine(
         repo=registry.model_repo,
@@ -79,15 +81,15 @@ async def lifespan(app: FastAPI):
     # Warm-up: one request through the full path, single-threaded, before any
     # traffic — absorbs lazy first-call init so real users don't pay for it.
     app.state.inference_engine.warm_up()
-    print("[lifespan] inference engine ready ✓")
+    logger.info("inference engine ready")
 
     # 2. embedding model — same constant ingest and eval use, so the vectors
     #    we query with match the vectors Chroma was built with
-    print(f"[lifespan] loading embedding model ({EMBEDDING_MODEL})...")
+    logger.info("loading embedding model model=%s", EMBEDDING_MODEL)
     #    Wrapped: its fast tokenizer is not safe to call from several threads.
     app.state.embedding_model = ThreadSafeEmbedder(SentenceTransformer(EMBEDDING_MODEL))
     app.state.embedding_model.encode("warm-up")      # same warm-up idea as above
-    print("[lifespan] embedding model ready ✓")
+    logger.info("embedding model ready")
 
     # 3. vector store
     app.state.chroma_client = await _connect_chroma(
@@ -99,21 +101,20 @@ async def lifespan(app: FastAPI):
     app.state.llm_client = Anthropic(
         api_key=settings.llm.anthropic_api_key.get_secret_value(),
     )
-    print("[lifespan] LLM client ready ✓")
+    logger.info("llm client ready")
 
-    print("[lifespan] all resources loaded — app ready\n")
+    logger.info("all resources loaded, app ready")
 
     yield
 
     # ------------------------------------------------------------------ #
     # SHUTDOWN                                                             #
     # ------------------------------------------------------------------ #
-    print("[lifespan] shutting down...")
+    logger.info("shutting down")
     app.state.llm_client.close()   # release its HTTP connection pool
     # inference_engine / embedding_model: plain in-memory objects, nothing to close.
     # chroma_client: no public close() in chromadb 1.5.9; freed with the process.
-    print("[lifespan] shutdown complete")
-
+    logger.info("shutdown complete")
 
 async def _connect_chroma(host: str, port: int) -> ClientAPI:
     """
@@ -129,22 +130,22 @@ async def _connect_chroma(host: str, port: int) -> ClientAPI:
     Uses await asyncio.sleep, not time.sleep: lifespan is async, and a
     blocking sleep would freeze the event loop for its whole duration.
     """
-    print(f"[lifespan] connecting to ChromaDB at {host}:{port}...")
+    logger.info("connecting to chroma host=%s port=%d", host, port)
 
     for attempt in range(1, CHROMA_CONNECT_ATTEMPTS + 1):
         try:
             candidate = HttpClient(host=host, port=port)
             candidate.heartbeat()
-            print("[lifespan] chroma connected ✓")
+            logger.info("chroma connected attempt=%d", attempt)
             return candidate                      # only a proven client leaves
         except Exception as exc:
             if attempt == CHROMA_CONNECT_ATTEMPTS:
                 break                             # no pointless sleep after the last try
             wait = min(0.5 * 2 ** (attempt - 1), CHROMA_MAX_BACKOFF_S)   # 0.5, 1, 2, 4, 8, 8, ...
-            print(
-                f"[lifespan] chroma not ready ({type(exc).__name__}), "
-                f"retry in {wait:.1f}s (attempt {attempt}/{CHROMA_CONNECT_ATTEMPTS})"
-            )
+            logger.warning(
+                    "chroma not ready error=%s retry_in_s=%.1f attempt=%d/%d",
+                    type(exc).__name__, wait, attempt, CHROMA_CONNECT_ATTEMPTS,
+                )
             await asyncio.sleep(wait)
 
     raise RuntimeError(

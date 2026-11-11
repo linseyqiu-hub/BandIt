@@ -23,7 +23,7 @@ tracebacks. Call .get_secret_value() only at the point of use.
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import Field, SecretStr, ValidationError, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -123,6 +123,14 @@ class ApiSettings(_GroupSettings):
         if isinstance(value, str):
             return [origin.strip() for origin in value.split(",") if origin.strip()]
         return value
+    # LOG_LEVEL — root logger level, applied by core/logging_setup.py.
+    # A typo (LOG_LEVEL=INFOO) fails at startup like any other bad setting.
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+
+    @field_validator("log_level", mode="before")
+    @classmethod
+    def _upper_log_level(cls, value):
+        return value.strip().upper() if isinstance(value, str) else value
 
 
 # ── Loading ─────────────────────────────────────────────────────────────

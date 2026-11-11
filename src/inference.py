@@ -10,6 +10,7 @@ from a server, a test, or a notebook without any env setup.
 import os
 import sys
 import threading
+import logging
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import torch
@@ -18,6 +19,8 @@ from transformers import DebertaV2Tokenizer
 from model import BandItScorer
 
 from core.constants import MODEL_NAME, MAX_LENGTH, LABEL_COLUMNS
+
+logger = logging.getLogger(__name__)
 
 
 # ------------------------------------------------------------------
@@ -28,7 +31,7 @@ def load_model(checkpoint_path: str, device: torch.device) -> BandItScorer:
     """
     Loads BandItScorer from a checkpoint file on disk.
     """
-    print(f"[inference] loading model from {checkpoint_path} ...")
+    logger.info("loading model checkpoint=%s", checkpoint_path)
 
     model = BandItScorer(pretrained=False, dropout=0.0)
     checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -38,19 +41,15 @@ def load_model(checkpoint_path: str, device: torch.device) -> BandItScorer:
 
     epoch   = checkpoint.get("epoch",   "unknown")
     val_mae = checkpoint.get("val_mae", "unknown")
-    if isinstance(val_mae, float):
-        print(f"[inference] loaded checkpoint — epoch {epoch}, val MAE {val_mae:.4f}")
-    else:
-        print(f"[inference] loaded checkpoint — epoch {epoch}, val MAE {val_mae}")
-    print(f"[inference] model ready on {device}")
-
+    logger.info("loaded checkpoint epoch=%s val_mae=%s", epoch, val_mae)
+    logger.info("model ready device=%s", device)
     return model
 
 
 def load_tokenizer():
-    print(f"[inference] loading tokenizer: {MODEL_NAME} ...")
+    logger.info("loading tokenizer model=%s", MODEL_NAME)
     tokenizer = DebertaV2Tokenizer.from_pretrained(MODEL_NAME)
-    print(f"[inference] tokenizer ready.")
+    logger.info("tokenizer ready")
     return tokenizer
 
 
@@ -245,7 +244,7 @@ class BandItInferenceEngine:
         # on the expensive part.
         self._tokenizer_lock = threading.Lock()
 
-        print(f"[BandItInferenceEngine] ready.")
+        logger.info("inference engine initialised")
 
     def _tokenize(self, question: str, essay: str) -> dict:
         with self._tokenizer_lock:
@@ -290,6 +289,9 @@ class BandItInferenceEngine:
 # ------------------------------------------------------------------
 
 if __name__ == "__main__":
+    # Run by hand, outside the server: no configure_logging() has run, so
+    # without this the INFO lines from load_model() would be dropped.
+    logging.basicConfig(level=logging.INFO, format="%(levelname)-8s %(name)s: %(message)s")
 
     CHECKPOINT = "checkpoints/best_model_v5.pt"
 

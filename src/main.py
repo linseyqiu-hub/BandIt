@@ -19,6 +19,7 @@ stack before lifespan starts, so CORS can only be configured here.
 
 import os
 import sys
+import logging
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -27,8 +28,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from core.lifespan import lifespan
+from core.logging_setup import configure_logging
 from core.settings import ServingSettings
 from routers import feedback, health, scoring
+
+logger = logging.getLogger(__name__)
 
 
 def create_app() -> FastAPI:
@@ -48,7 +52,14 @@ def create_app() -> FastAPI:
     app.state.settings = settings
 
     # ------------------------------------------------------------------
-    # Phase 1b — middleware
+    # Phase 1b — logging. Right after settings: the level comes from them.
+    # Everything logged from here on (incl. lifespan) is formatted.
+    # ------------------------------------------------------------------
+    configure_logging(settings.api.log_level)
+    logger.info("logging configured level=%s", settings.api.log_level)
+
+    # ------------------------------------------------------------------
+    # Phase 1c — middleware
     # ------------------------------------------------------------------
     app.add_middleware(
         CORSMiddleware,
@@ -59,7 +70,7 @@ def create_app() -> FastAPI:
     )
 
     # ------------------------------------------------------------------
-    # Phase 1c — routers
+    # Phase 1d — routers
     # ------------------------------------------------------------------
     app.include_router(health.router)    # /, /health, /ready
     app.include_router(scoring.router)   # /score
