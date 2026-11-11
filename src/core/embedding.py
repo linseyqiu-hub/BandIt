@@ -36,5 +36,6 @@ class ThreadSafeEmbedder:
         self._lock = threading.Lock()
 
     def encode(self, *args, **kwargs):
+        kwargs.setdefault("show_progress_bar", False)
         with self._lock:
             return self._model.encode(*args, **kwargs)
