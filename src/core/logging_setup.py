@@ -11,6 +11,11 @@ Two layers, each with one job:
 So this file never opens a log file and never rotates anything.
 
 How it fits the logging tree:
+    Request IDs: RequestIdFilter copies request_id_var (core/request_context.py)
+    onto every record, and the format prints it as [%(request_id)s]. The filter
+    sits on the HANDLER, not the root logger: logger filters only run on the
+    logger that created the record, never during the climb to root, while
+    handler filters run for every record the handler receives.
     Every module does   logger = logging.getLogger(__name__)
     Those loggers have no handlers and no level of their own (NOTSET), so
     every record climbs to the ROOT logger. We put the ONE handler there and
@@ -26,8 +31,9 @@ Call configure_logging() first thing in an entrypoint, after settings load.
 import logging
 import sys
 import time
+from core.request_context import request_id_var
 
-LOG_FORMAT = "%(asctime)s %(levelname)-8s %(name)s: %(message)s"
+LOG_FORMAT = "%(asctime)s %(levelname)-8s [%(request_id)s] %(name)s: %(message)s"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%SZ"   # "Z" = UTC, see converter below
 
 # Libraries that log at INFO on every call. They get their own level, so
@@ -37,6 +43,12 @@ NOISY_LOGGERS = {
     "httpcore": logging.WARNING,   # connection-level detail under httpx
 }
 
+class RequestIdFilter(logging.Filter):
+     """Stamp the current request's ID on the record. Never drops a record."""
+
+     def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = request_id_var.get()   # "-" outside a request
+        return True
 
 def configure_logging(level: str) -> None:
     """
@@ -45,6 +57,7 @@ def configure_logging(level: str) -> None:
     Safe to call more than once: existing root handlers are replaced, never
     stacked, so a second call cannot produce duplicate lines.
     """
+    
     formatter = logging.Formatter(fmt=LOG_FORMAT, datefmt=DATE_FORMAT)
     # UTC timestamps: containers already run in UTC, but a host run would use
     # local time. One clock everywhere makes laptop and cloud logs comparable.
@@ -52,7 +65,7 @@ def configure_logging(level: str) -> None:
 
     handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(formatter)
-
+    handler.addFilter(RequestIdFilter())  # on the handler: runs for every record
     root = logging.getLogger()
     for old in root.handlers[:]:          # copy: we mutate the list while looping
         root.removeHandler(old)

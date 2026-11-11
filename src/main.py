@@ -21,6 +21,7 @@ import os
 import sys
 import logging
 
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
@@ -31,6 +32,7 @@ from core.lifespan import lifespan
 from core.logging_setup import configure_logging
 from core.settings import ServingSettings
 from routers import feedback, health, scoring
+from middleware.request_id import RequestIdMiddleware
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +69,12 @@ def create_app() -> FastAPI:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        # Browsers hide custom response headers from frontend JS unless exposed.
+        expose_headers=["X-Request-ID"],
     )
+    # MUST stay last: the last middleware added is the OUTERMOST layer, so the
+    # request ID exists before any other middleware or route code runs.
+    app.add_middleware(RequestIdMiddleware)
 
     # ------------------------------------------------------------------
     # Phase 1d — routers
