@@ -93,7 +93,9 @@ USER bandit
 # Start the API. --host 0.0.0.0 is required — without it
 # uvicorn binds to 127.0.0.1 (loopback only), which means
 # published ports and other containers can't reach it.
-CMD ["uvicorn", "src.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
+# --no-access-log: our request middleware logs every request
+# (with request ID + duration) instead. uvicorn.error stays on.
+CMD ["uvicorn", "src.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
 
 
 # ── Stage 3: ingest ─────────────────────────────────────────
