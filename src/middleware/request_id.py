@@ -66,6 +66,7 @@ class RequestIdMiddleware:
         path = scope["path"]                    # path only, never the query string (privacy)
         log = path not in SKIP_PATHS
         status = None                           # unknown until FastAPI sends the response
+        crash_error = None                      # exception type, only if one flew past us
 
         # Defined now, RUN later (⑤/⑥) — FastAPI calls it to send its response.
         async def send_with_header(message):
@@ -84,19 +85,27 @@ class RequestIdMiddleware:
 
         try:
             await self.app(scope, receive, send_with_header)    # ④ … ⑦
-        except Exception:
+        except Exception as e:
             status = 500                        # crash: the 500 is built outside this layer
+            crash_error = type(e).__name__      # name it in OUR line, next to the request ID
             raise                               # never swallow; uvicorn prints the traceback
         finally:
             # ⑧
             if log:
                 duration_ms = (time.perf_counter() - start) * 1000
                 level = logging.ERROR if status is None or status >= 500 else logging.INFO
-                logger.log(
-                    level,
-                    "request done method=%s path=%r status=%s duration_ms=%d",
-                    method, path, status, duration_ms,
-                )
+                if crash_error is None:
+                    logger.log(
+                        level,
+                        "request done method=%s path=%r status=%s duration_ms=%d",
+                        method, path, status, duration_ms,
+                    )
+                else:
+                    logger.log(
+                        level,
+                        "request done method=%s path=%r status=%s duration_ms=%d error=%s",
+                        method, path, status, duration_ms, crash_error,
+                    )
             # Whatever you set, you reset: the context goes back to "-" so nothing
             # logged after this request can show a stale ID.
             request_id_var.reset(token)

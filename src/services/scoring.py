@@ -120,11 +120,13 @@ def score_essay(question: str, essay: str, engine: BandItInferenceEngine) -> Sco
     try:
         result = engine.score_with_metadata(question, essay)
     except Exception as e:
+        # Type + traceback in OUR log (message redacted); never str(e) to the client.
+        logger.exception("inference failed error=%s", type(e).__name__)
         raise HTTPException(
             status_code=500,
             detail={
                 "code":    "INFERENCE_ERROR",
-                "message": f"Model inference failed: {str(e)}"
+                "message": "Model inference failed."
             }
         )
 

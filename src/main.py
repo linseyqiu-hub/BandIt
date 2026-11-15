@@ -60,6 +60,18 @@ def create_app() -> FastAPI:
     configure_logging(settings.api.log_level)
     logger.info("logging configured level=%s", settings.api.log_level)
 
+    # What is running, in one line. ALLOW-LIST: each field is named on purpose.
+    # Never loop over all settings — a secret added later must not leak by
+    # default. Not logged: HF_TOKEN, ANTHROPIC_API_KEY, REDIS_URL (may hold a password).
+    logger.info(
+        "config model_repo=%s model_version=%s llm_model=%s llm_max_tokens=%d "
+        "chroma=%s:%d log_level=%s cors_origins=%s",
+        settings.registry.model_repo, settings.registry.model_version,
+        settings.llm.llm_model, settings.llm.llm_max_tokens,
+        settings.chroma.host, settings.chroma.port,
+        settings.api.log_level, ",".join(settings.api.cors_origins),
+    )
+
     # ------------------------------------------------------------------
     # Phase 1c — middleware
     # ------------------------------------------------------------------
