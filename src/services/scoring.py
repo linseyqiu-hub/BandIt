@@ -1,13 +1,18 @@
+import logging
+import time
+
 from fastapi import HTTPException
 
 from core.constants import (
     ESSAY_MIN_WORDS,
     ESSAY_MAX_WORDS,
+    MAX_LENGTH,
     QUESTION_MIN_CHARS,
 )
 from inference import BandItInferenceEngine
 from schemas.responses import ScoreResponse, Scores, Meta
 
+logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------
 # Validation
@@ -100,11 +105,18 @@ def score_essay(question: str, essay: str, engine: BandItInferenceEngine) -> Sco
         HTTPException 500 on inference failure
     """
 
-    # Run validation gates — raises 400 on first failure
-    validate_input(question, essay)
+    # Run validation gates — raises 400 on first failure.
+    # Log WHY (the fixed error code, never the text): the middleware only
+    # sees status=400. INFO, not WARNING: a short essay is normal user behaviour.
+    try:
+        validate_input(question, essay)
+    except HTTPException as exc:
+        logger.info("validation failed code=%s", exc.detail["code"])
+        raise
 
     # Call the model — wrap in try/except so inference crashes
     # return a clean 500 instead of an ugly unhandled exception
+    t0 = time.perf_counter()
     try:
         result = engine.score_with_metadata(question, essay)
     except Exception as e:
@@ -120,6 +132,21 @@ def score_essay(question: str, essay: str, engine: BandItInferenceEngine) -> Sco
     # engine returns keys like "Task_Response" (training column names)
     # API contract uses snake_case: "task_response"
     raw_scores = result["scores"]
+
+    # Counts and derived numbers only — never the essay or question text.
+    # Question and essay are tokenized SEPARATELY (dual encoder), each up to
+    # MAX_LENGTH, so essay_tokens alone decides truncation.
+    logger.info(
+        "score done essay_words=%d question_words=%d essay_tokens=%d truncated=%s "
+        "tokens_dropped=%d tr=%.1f cc=%.1f lr=%.1f gra=%.1f overall=%.1f inference_ms=%d",
+        result["word_count"], len(question.split()),
+        result["token_count"], result["truncated"],
+        max(0, result["token_count"] - MAX_LENGTH),
+        raw_scores["Task_Response"], raw_scores["Coherence_Cohesion"],
+        raw_scores["Lexical_Resource"], raw_scores["Range_Accuracy"],
+        raw_scores["Overall"],
+        (time.perf_counter() - t0) * 1000,
+    )
 
     return ScoreResponse(
         scores=Scores(

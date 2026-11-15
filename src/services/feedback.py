@@ -4,8 +4,10 @@ Retrieves similar examiner comments via RRF fusion across two ChromaDB
 collections, then calls Claude API to generate criterion-aligned feedback.
 """
 
-from core.chroma import get_collections
 import logging
+import time
+
+from core.chroma import get_collections
 
 logger = logging.getLogger(__name__)
 
@@ -148,11 +150,13 @@ def generate_feedback(
       6. return feedback text
     """
     # --- 1. embed ---
+    t0 = time.perf_counter()
     embedding_model = app_state.embedding_model
     essay_emb    = embedding_model.encode([essay]).tolist()
     question_emb = embedding_model.encode([question]).tolist()
 
     # --- 2. query ---
+    t1 = time.perf_counter()
     essays_col, questions_col = get_collections(app_state)
 
     essay_results = essays_col.query(
@@ -203,6 +207,15 @@ def generate_feedback(
         {"text": docs_map[id_], "overall": overall_map[id_]}
         for id_ in top_ids
     ]
+        # Log counts, timings and OUR dataset IDs — never the essay or question text.
+    t2 = time.perf_counter()
+    logger.info(
+        "retrieval done essay_words=%d embed_ms=%d query_ms=%d top_ids=%s",
+        len(essay.split()),
+        (t1 - t0) * 1000,
+        (t2 - t1) * 1000,          # Chroma queries + RRF fusion (fusion is microseconds)
+        ",".join(top_ids),
+    )
 
     # --- 4. build prompt ---
     user_prompt = build_prompt(question, essay, scores, examiner_comments, tone)
@@ -213,11 +226,24 @@ def generate_feedback(
     # this function runs on many worker threads at once.
     client   = app_state.llm_client
     llm      = app_state.settings.llm
+    t3 = time.perf_counter()
     response = client.messages.create(
         model      = llm.llm_model,
         max_tokens = llm.llm_max_tokens,
         system     = SYSTEM_PROMPT,
         messages   = [{"role": "user", "content": user_prompt}],
+    )
+    feedback_text = response.content[0].text
+
+    # Tokens, not dollars: prices change, token counts are facts.
+    logger.info(
+        "llm done model=%s tone=%s input_tokens=%d output_tokens=%d "
+        "stop_reason=%s llm_ms=%d feedback_words=%d",
+        llm.llm_model, tone,
+        response.usage.input_tokens, response.usage.output_tokens,
+        response.stop_reason,
+        (time.perf_counter() - t3) * 1000,
+        len(feedback_text.split()),
     )
     if response.stop_reason == "max_tokens":
         logger.warning(
@@ -225,5 +251,5 @@ def generate_feedback(
             llm.llm_max_tokens, response.usage.output_tokens,
         )
 
-    # --- 6. return ---
-    return response.content[0].text 
+     # --- 6. return ---
+    return feedback_text
